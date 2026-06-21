@@ -1,0 +1,36 @@
+# Build artifacts & deps — rebuilt inside the image
+node_modules
+dist
+
+# Secrets — never bake credentials into an image layer
+.env
+.env.*
+!.env.example
+
+# Git & CI
+.git
+.gitattributes
+.gitignore
+.github
+
+# Editor / OS / agent
+.claude
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Docs & meta not needed at runtime
+docs
+*.md
+!README.md
+
+mcpb
+*.mcpb
+
+# Logs
+*.log
+npm-debug.log*
+
+# Docs
+docs/*

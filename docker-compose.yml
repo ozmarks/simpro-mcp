@@ -1,0 +1,90 @@
+# Standalone Portainer stack for the Simpro MCP server.
+#
+# Defaults to BROKER mode: the container is its own OAuth 2.1 authorization
+# server in front of Simpro, so users sign in to Simpro themselves and no Simpro
+# credential is forwarded by anyone upstream. This is the safer default — it
+# authenticates on its own rather than trusting a header from in front of it.
+# It still must sit behind a reverse proxy / gateway that terminates TLS and
+# exposes PUBLIC_URL publicly; only DON'T expose the raw container.
+#
+# For PROXY mode instead (stateless passthrough behind a gateway that does the
+# auth and forwards a per-request Bearer — e.g. Context Forge / Cowork), set
+# SIMPRO_TRANSPORT=proxy and drop the broker-only vars below.
+#
+# In Portainer: deploy as a Git-backed stack pointing at this repo. Set the
+# env vars below in the stack's "Environment variables" panel (don't commit a
+# populated .env).
+#
+# To use a prebuilt image (e.g. from GHCR) instead of building in Portainer,
+# replace `build: .` with `image: ghcr.io/ozmarks/simpro-mcp:<tag>`.
+
+services:
+  simpro-mcp:
+    build: .
+    image: ghcr.io/ozmarks/simpro-mcp:latest
+    container_name: simpro-mcp
+    restart: unless-stopped
+
+    environment:
+      # --- Required ---------------------------------------------------------
+      # Region-specific Simpro build host. No trailing slash, no /api path.
+      SIMPRO_BASE_URL: ${SIMPRO_BASE_URL:?set SIMPRO_BASE_URL in the stack env}
+      # Simpro company id (this account is 0).
+      SIMPRO_COMPANY_ID: ${SIMPRO_COMPANY_ID:-0}
+
+      # --- Transport (HTTP) -------------------------------------------------
+      SIMPRO_TRANSPORT: ${SIMPRO_TRANSPORT:-broker}
+      PORT: 3000
+      MCP_PATH: ${MCP_PATH:-/mcp}
+
+      # --- Broker mode (the default) ---------------------------------------
+      # Public address users reach the connector at (where TLS terminates).
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL for broker mode (or switch SIMPRO_TRANSPORT=proxy)}
+      # Simpro OAuth app credentials the broker uses to relay to Simpro.
+      SIMPRO_CLIENT_ID: ${SIMPRO_CLIENT_ID:?set SIMPRO_CLIENT_ID for broker mode}
+      SIMPRO_CLIENT_SECRET: ${SIMPRO_CLIENT_SECRET:?set SIMPRO_CLIENT_SECRET for broker mode}
+      # Key that seals each user's Simpro tokens inside the broker token. Leave
+      # unset and one is auto-generated to /data (the volume below); set it to
+      # manage the key externally. MUST persist or everyone is signed out.
+      TOKEN_SEAL_KEY: ${TOKEN_SEAL_KEY:-}
+
+      # --- Optional tuning --------------------------------------------------
+      # Default rows per list page when the caller omits pageSize (max 250).
+      SIMPRO_DEFAULT_PAGE_SIZE: ${SIMPRO_DEFAULT_PAGE_SIZE:-50}
+      # Hard ceiling (bytes) on a single serialized tool result.
+      SIMPRO_MAX_RESULT_BYTES: ${SIMPRO_MAX_RESULT_BYTES:-100000}
+      # No SIMPRO_API_KEY on the HTTP path: it refuses to start with it set.
+
+    volumes:
+      - broker-state:/data
+
+    networks:
+      - mcp-gateway
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get({host:'127.0.0.1',port:process.env.PORT||3000,path:'/healthz'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # No `ports:` by default — the gateway reaches it in-network at
+    # http://simpro-mcp:3000/mcp. Uncomment to expose it on the host for local
+    # testing (TLS should be terminated upstream, not here):
+    # ports:
+    #   - "3000:3000"
+
+# Shared network that Context Forge / the MCP gateway stack also joins.
+# Create it once on the host:  docker network create mcp-gateway
+networks:
+  mcp-gateway:
+    external: true
+    name: mcp-gateway
+
+# Persists the broker's state (seal key, DCR clients) across restarts/redeploys.
+volumes:
+  broker-state:

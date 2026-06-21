@@ -1,0 +1,53 @@
+name: Build & release MCPB
+
+# Builds the Claude Desktop .mcpb bundle and attaches it to a GitHub Release.
+#
+# Trigger:
+#   - Push a version tag (e.g. `git tag v0.1.0 && git push --tags`) -> builds and
+#     publishes a Release with the .mcpb attached.
+#   - Manual run (Actions tab -> "Run workflow") -> builds and uploads the bundle
+#     as a workflow artifact only (no Release), for testing the pipeline.
+#
+# Keep package.json `version` and mcpb/manifest.json `version` in sync with the
+# tag; scripts/build-mcpb.mjs fails the build if the two files disagree.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create the Release and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build MCPB bundle
+        run: npm run build:mcpb
+
+      - name: Upload bundle as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simpro-mcp-server-mcpb
+          path: simpro-mcp-server.mcpb
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: simpro-mcp-server.mcpb
+          generate_release_notes: true
+          fail_on_unmatched_files: true

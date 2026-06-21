@@ -1,0 +1,97 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
+  "name": "simpro-mcp-server",
+  "display_name": "Simpro",
+  "version": "0.1.0",
+  "description": "Query and manage Simpro quotes, jobs, customers, catalog, and line items from Claude.",
+  "long_description": "An MCP server that exposes Simpro operations - quotes, jobs, customers, catalog, line items, and cross-collection aggregations to an LLM. Runs locally over stdio. Authenticate with Simpro OAuth (authorization_code via a one-time browser login, or client_credentials) or an API key. Reaches all ~1,300 Simpro endpoints via a generic escape hatch plus a set of guided workflow tools.",
+  "author": {
+    "name": "Ozmarks Group"
+  },
+  "homepage": "https://github.com/Ozmarks/simpro-mcp#readme",
+  "documentation": "https://github.com/Ozmarks/simpro-mcp#readme",
+  "support": "https://github.com/Ozmarks/simpro-mcp/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "SIMPRO_BASE_URL": "${user_config.base_url}",
+        "SIMPRO_COMPANY_ID": "${user_config.company_id}",
+        "SIMPRO_AUTH_MODE": "${user_config.auth_mode}",
+        "SIMPRO_CLIENT_ID": "${user_config.client_id}",
+        "SIMPRO_CLIENT_SECRET": "${user_config.client_secret}",
+        "SIMPRO_AUTH_REDIRECT_PORT": "${user_config.auth_redirect_port}",
+        "SIMPRO_API_KEY": "${user_config.api_key}",
+        "SIMPRO_DEFAULT_PAGE_SIZE": "${user_config.default_page_size}"
+      }
+    }
+  },
+  "user_config": {
+    "base_url": {
+      "type": "string",
+      "title": "Simpro base URL",
+      "description": "Your specific Simpro build host, e.g. https://yourbuild.simprosuite.com — no trailing slash, no /api path.",
+      "required": true
+    },
+    "company_id": {
+      "type": "string",
+      "title": "Company ID",
+      "description": "Your Simpro company id. Most single-company accounts are 0.",
+      "default": "0",
+      "required": true
+    },
+    "auth_mode": {
+      "type": "string",
+      "title": "Authentication mode",
+      "description": "How to authenticate to Simpro: authorization_code (User based browser login, recommended), client_credentials (Access to everything, no user impersonation), or api_key (not recommended).",
+      "default": "authorization_code",
+      "required": true
+    },
+    "client_id": {
+      "type": "string",
+      "title": "Simpro OAuth client ID",
+      "description": "Client ID of your Simpro OAuth app. Required for authorization_code and client_credentials modes.",
+      "required": false
+    },
+    "client_secret": {
+      "type": "string",
+      "title": "Simpro OAuth client secret",
+      "description": "Client secret of your Simpro OAuth app. Required for authorization_code and client_credentials modes.",
+      "sensitive": true,
+      "required": false
+    },
+    "auth_redirect_port": {
+      "type": "number",
+      "title": "Auth redirect port",
+      "description": "Localhost port for OAuth flow. Must match the port of the redirect URI registered in Simpro (http://localhost:<port>/callback).",
+      "default": 8237,
+      "required": false
+    },
+    "api_key": {
+      "type": "string",
+      "title": "Simpro API Key",
+      "description": "A standalone API key (Setup > Integrations > API). Only used when authentication mode is api_key.",
+      "sensitive": true,
+      "required": false
+    },
+    "default_page_size": {
+      "type": "number",
+      "title": "Default page size",
+      "description": "Rows per page for list tools when unspecified (1–250). Lower keeps results within Claude's context window.",
+      "default": 50,
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=20"
+    }
+  }
+}
