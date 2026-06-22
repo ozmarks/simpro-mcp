@@ -1,5 +1,9 @@
 # Simpro MCP server
 
+> **Unofficial.** This is an independent, third-party project. It is **not affiliated with,
+> endorsed by, or supported by Simpro**. "Simpro" is a trademark of its respective owner and is
+> used here only to describe what this software connects to.
+
 Lets an AI agent work with your Simpro account — look up quotes, jobs, customers, and the
 catalogue, read and update line items, and pull together figures that would normally mean
 clicking through several screens. You ask in plain English; the agent does the lookups and
@@ -53,7 +57,7 @@ must use the same port.
 ### Installing
 
 1. Download the latest **`simpro-mcp-server.mcpb`** file from the
-   [Releases page](https://github.com/Ozmarks/simpro-mcp/releases).
+   [Releases page](https://github.com/ozmarks/simpro-mcp/releases).
 2. In Claude Desktop, open **Settings → Extensions**, click **Advanced settings**, then
    **Install extension** (you may first need to enable developer/extension installs there).
    Pick the `simpro-mcp-server.mcpb` file you downloaded. An install screen appears.

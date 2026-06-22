@@ -2,7 +2,7 @@
 
 # ---- Stage 1: build ----------------------------------------------------------
 # Compile TypeScript -> dist/ and copy data/ -> dist/data/. Needs devDeps (tsc).
-FROM node:20-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 
 # Install ALL deps (incl. devDeps) against the lockfile for a reproducible build.
@@ -19,7 +19,7 @@ RUN npm run build
 # ---- Stage 2: runtime --------------------------------------------------------
 # Ship only production deps + the compiled, self-contained dist/ (which already
 # contains dist/data via copy-data.mjs). No source, no tsc, no devDeps.
-FROM node:20-alpine AS runtime
+FROM node:24-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
