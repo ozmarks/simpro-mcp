@@ -7,7 +7,8 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { loadConfig, type Config, type BrokerConfig } from "./config.js";
 import { SimproClient } from "./simproClient.js";
-import { registerTools } from "./tools.js";
+import { registerTools, formatUpdateNotice } from "./tools.js";
+import { VersionChecker } from "./versionCheck.js";
 import { brokerRouter, unsealForRequest } from "./auth/broker.js";
 import { ClientCredentialsProvider } from "./auth/simproToken.js";
 import { AuthCodeProvider } from "./auth/authCodeProvider.js";
@@ -63,10 +64,28 @@ function transportOptions(extraHosts: string[] = [], extraOrigins: string[] = []
   };
 }
 
-function buildServer(client: SimproClient, cfg: Config): McpServer {
-  const server = new McpServer({ name: "simpro-mcp-server", version: "0.1.0" });
-  registerTools(server, client, cfg);
+function buildServer(client: SimproClient, cfg: Config, versionChecker?: VersionChecker): McpServer {
+  const server = new McpServer({ name: "simpro-mcp-server", version: cfg.version });
+  registerTools(server, client, cfg, versionChecker);
   return server;
+}
+
+// Start the periodic version check (opt-out via SIMPRO_VERSION_CHECK=off). Returns the checker so
+// stdio can surface its result on a tool result; HTTP/broker only log, so they ignore the return.
+function startVersionCheck(cfg: Config, surface: "result" | "log"): VersionChecker | undefined {
+  if (!cfg.versionCheckEnabled) return undefined;
+  const checker = new VersionChecker(cfg.version, cfg.versionCheckUrl);
+  let logged = false;
+  checker.start(
+    surface === "log"
+      ? (u) => {
+          if (logged) return; // log once per process, not every interval
+          logged = true;
+          log(`update available — ${formatUpdateNotice(u)}`);
+        }
+      : undefined,
+  );
+  return checker;
 }
 
 function bearerFrom(req: IncomingMessage): string | undefined {
@@ -107,7 +126,8 @@ async function runStdio(cfg: Config): Promise<void> {
   }
 
   const client = new SimproClient(cfg, undefined, true, provider);
-  const server = buildServer(client, cfg);
+  const versionChecker = startVersionCheck(cfg, "result");
+  const server = buildServer(client, cfg, versionChecker);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const authLabel =
@@ -143,6 +163,7 @@ async function runHttp(cfg: Config): Promise<void> {
   const path = process.env.MCP_PATH ?? "/mcp";
 
   log(`simpro-mcp-server starting (proxy) — binding ${host}:${port}, mcp path ${path}`);
+  startVersionCheck(cfg, "log");
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const startedAt = Date.now();
@@ -233,6 +254,7 @@ async function runBrokerHttp(cfg: Config, broker: BrokerConfig): Promise<void> {
   const brokerHosts = [...new Set([publicHost, publicHost.split(":")[0], `${publicHost.split(":")[0]}:${port}`])];
 
   log(`simpro-mcp-server starting (broker) — binding ${host}:${port}, mcp path ${path}, public url ${broker.publicUrl}, resource ${broker.resourceUrl}`);
+  startVersionCheck(cfg, "log");
 
   const app = express();
   app.use((req, res, next) => {

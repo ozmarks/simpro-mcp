@@ -48,6 +48,23 @@ class RateLimiter {
 
 const sharedLimiter = new RateLimiter(8, 8);
 
+// Simpro reports a created/updated record's id on a write either as a trailing numeric segment
+// of the Location header (.../catalogs/123) or in a Resource-ID header. Prefer Resource-ID.
+export function extractResourceId(headers: Headers): string | number | undefined {
+  const direct = headers.get("Resource-ID") ?? headers.get("Resource-Id");
+  if (direct && direct.trim()) {
+    const n = Number(direct.trim());
+    return Number.isFinite(n) ? n : direct.trim();
+  }
+  const loc = headers.get("Location");
+  if (loc) {
+    const seg = loc.split("?")[0].replace(/\/+$/, "").split("/").pop() ?? "";
+    if (/^\d+$/.test(seg)) return Number(seg);
+    if (seg) return seg;
+  }
+  return undefined;
+}
+
 export class SimproClient {
   private readonly limiter = sharedLimiter;
   private static readonly MAX_429_RETRIES = 4;
@@ -179,6 +196,22 @@ export class SimproClient {
   ): Promise<unknown> {
     const { body } = await this.requestRaw(method, path, opts);
     return body;
+  }
+
+  // Like request(), but also returns the created/updated resource id Simpro reports via the
+  // Location header (or a Resource-ID header on a 204), so a write tool can echo a receipt.
+  async requestWithReceipt(
+    method: string,
+    path: string,
+    opts: {
+      query?: Record<string, unknown>;
+      body?: unknown;
+      bearer?: string;
+      mergeMode?: boolean;
+    } = {},
+  ): Promise<{ body: unknown; resourceId?: string | number }> {
+    const { body, headers } = await this.requestRaw(method, path, opts);
+    return { body, resourceId: extractResourceId(headers) };
   }
 
   get(path: string, query?: Record<string, unknown>, bearer?: string) {
