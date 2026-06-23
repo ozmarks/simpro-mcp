@@ -5,6 +5,25 @@ import { SimproClient, SimproError } from "./simproClient.js";
 import { cleanRichText, applyLean } from "./format.js";
 import { searchEndpoints } from "./catalog.js";
 import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
+import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
+
+// One-line agent-facing update notice (stdio surfaces it on a tool result; HTTP logs it instead).
+export function formatUpdateNotice(u: UpdateInfo): string {
+  return (
+    `A newer version of simpro-mcp-server is available: ${u.latest} (running ${u.current}).` +
+    (u.notice ? ` ${u.notice}` : "") +
+    (u.url ? ` See ${u.url}.` : "")
+  );
+}
+
+type ToolResult = { content: Array<{ type: "text"; text: string }> };
+
+// Append the update notice as an extra content block. Pure; the once-per-session latch lives in
+// registerTools (it owns the `sent` flag).
+export function appendUpdateNotice(result: ToolResult, update: UpdateInfo | undefined): ToolResult {
+  if (!update) return result;
+  return { content: [...result.content, { type: "text", text: formatUpdateNotice(update) }] };
+}
 
 function okWithBudget(data: unknown, maxBytes = Number.POSITIVE_INFINITY, doLean = false) {
   const cleaned = doLean ? applyLean(cleanRichText(data)) : cleanRichText(data);
@@ -109,10 +128,29 @@ export function writeReceipt(body: unknown, resourceId: string | number | undefi
   return { resourceId, result: body };
 }
 
-export function registerTools(server: McpServer, client: SimproClient, cfg: Config): void {
+export function registerTools(
+  server: McpServer,
+  client: SimproClient,
+  cfg: Config,
+  versionChecker?: VersionChecker,
+): void {
   const defaultPageSize = cfg.defaultPageSize;
-  const ok = (data: unknown) => okWithBudget(data, cfg.maxResultBytes, false);
-  const okLean = (data: unknown) => okWithBudget(data, cfg.maxResultBytes, true);
+
+  // Surface a "new version available" notice as an extra content block on the FIRST tool result
+  // of this server's lifetime, then latch off. stdio = one long-lived server, so this fires once
+  // per session; the HTTP transports rebuild per request (and log the notice instead), so they
+  // pass no checker here and never reach this path.
+  let updateNoticeSent = false;
+  const withUpdateNotice = (result: { content: Array<{ type: "text"; text: string }> }) => {
+    if (updateNoticeSent || !versionChecker) return result;
+    const update = versionChecker.getUpdate();
+    if (!update) return result;
+    updateNoticeSent = true;
+    return appendUpdateNotice(result, update);
+  };
+
+  const ok = (data: unknown) => withUpdateNotice(okWithBudget(data, cfg.maxResultBytes, false));
+  const okLean = (data: unknown) => withUpdateNotice(okWithBudget(data, cfg.maxResultBytes, true));
 
   // POST/PUT/PATCH/DELETE through one path that echoes the resource id as a receipt.
   const okWrite = async (

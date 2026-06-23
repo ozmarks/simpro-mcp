@@ -28,7 +28,9 @@ There is a **test suite** (`npm test`: compiles via `tsconfig.test.json` to
 the pure, deterministic units: `catalog.search` (`find_operation` ranking),
 `format` (HTML cleaning + the lean pass), `lineItems` (item-type map + path
 building), `writeReceipt` (`extractResourceId` header parsing + the `writeReceipt`/
-`footgunHint`/`annotateNullUom` shaping), and `auth/{seal,dcrStore,flowState}` (crypto round-trips, DCR
+`footgunHint`/`annotateNullUom` shaping), `versionCheck` (`compareVersions` + the
+fire-and-forget `VersionChecker` against a stubbed fetch + `appendUpdateNotice` latch), and
+`auth/{seal,dcrStore,flowState}` (crypto round-trips, DCR
 registration, flow-store TTL semantics) — no network mocking, so the HTTP client,
 token provider, and broker routes are not unit-tested. No linter or formatter is
 configured. Beyond the unit tests, "verifying" a change still means building and
@@ -53,6 +55,24 @@ start` line on a bind error, and a timestamped access line per request
 Other tuning knobs (read in `config.ts`, both have defaults): `SIMPRO_DEFAULT_PAGE_SIZE`
 (default 50, Simpro max 250) and `SIMPRO_MAX_RESULT_BYTES` (default 100 000 — hard
 ceiling on a single serialized tool result).
+
+### Version check (`versionCheck.ts`)
+
+A background check flags when a newer release is published. The running version is
+single-sourced from `package.json` (`readPackageVersion()` in `config.ts`; `dist/` sits
+one level under the package root, and the Dockerfile copies `package.json` into the image,
+so `../package.json` resolves in both layouts). `VersionChecker` fetches a small hosted
+`version.json` (default `raw.githubusercontent.com/ozmarks/simpro-mcp/main/version.json`,
+override with `SIMPRO_VERSION_CHECK_URL`) — at startup and every 6h on an **unref'd** timer
+(never keeps the process alive) — and `compareVersions` (dotted-numeric, suffixes ignored)
+decides if it's newer. The fetch is time- and size-capped and **fire-and-forget**: any
+failure is swallowed and never touches a tool call. On by default; `SIMPRO_VERSION_CHECK=off`
+disables it. **Surface differs by transport:** stdio (one long-lived server) appends a notice
+as an extra content block on the **first** tool result, then latches off (`appendUpdateNotice`
++ the `updateNoticeSent` flag in `registerTools`); the HTTP transports rebuild per request and
+hold no session, so they **log** the notice to stderr once instead and pass no checker to
+`registerTools`. `version.json` lives at the repo root and is served by GitHub raw — bump its
+`version` (and `package.json`) on release.
 
 ### Deployment (containerized — Portainer / Context Forge)
 
@@ -182,6 +202,8 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/lineItems.ts` | The 7 cost-center item types: URL segment, required anchor field, supported verbs. |
 | `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
 | `src/format.ts` | Output shaping: HTML rich-text → compact text/markdown, recursive cleaning. |
+| `src/versionCheck.ts` | Background "newer release available?" check: fetch hosted `version.json`, `compareVersions`, cache + unref'd timer. Fire-and-forget. |
+| `version.json` | The hosted version manifest (`{version, url, notice}`), served by GitHub raw; bump on release. |
 | `data/simpro-api-index.json` | Prebuilt index of ~1,300 endpoints (method/path/summary/tags/params). Ships with the build. |
 | `scripts/copy-data.mjs` | Copies `data/` → `dist/data/` so `dist/` is self-contained in prod. |
 | `tsconfig.test.json` | Test build: compiles `src/` + `test/` to `dist-test/` for `node --test`. |
