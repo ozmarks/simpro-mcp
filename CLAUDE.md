@@ -174,18 +174,35 @@ the `requestBearer` wiring in `simproClient.ts`).
 ### Tool surface design (read this before adding a tool)
 
 The surface is **hybrid**: a small set of intent/workflow tools **plus a generic
-escape hatch** (`find_operation` → `simpro_api_get`/`simpro_api_post`/`simpro_api_put`/`simpro_api_delete`) that reaches
-all ~1,300 Simpro endpoints. A new endpoint does **not** need a dedicated tool — it's
-already reachable via the escape hatch. A tool earns a dedicated slot only if it is:
+escape hatch** (`find_operation` → `describe_operation` → `simpro_api_get`/`simpro_api_post`/`simpro_api_put`/`simpro_api_delete`)
+that reaches all ~1,300 Simpro endpoints. A new endpoint does **not** need a dedicated
+tool — it's already reachable via the escape hatch. A tool earns a dedicated slot only
+if it is:
 
 - **multi-call orchestration** (e.g. `get_breakdown`, `duplicate_work`, `customer_overview`),
 - a **consolidation** of several endpoints (e.g. line-item tools across 7 types —
   `add_line_item`/`update_line_item`/`list_line_items` route by type and guard the
   capability gaps, e.g. assets have no PATCH; `find_customers` hiding the company/
-  individual split), or
+  individual split; `find_materials` searching catalogs **and** prebuilds in one call so
+  the agent learns whether a product name is a material vs an assembly — neither the name
+  nor any field declares it, so it's resolved by which collection answers), or
 - a **high-traffic guarded entry point** (e.g. `find_work`, `create_work`).
 
 Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
+
+**Schema discovery on the escape hatch.** The index carries the request-body schema
+(writes) and the resource's column list (GET) per endpoint, so the agent knows what to
+send/select without guessing — the original index dropped this. It's surfaced in two
+tiers so search stays lean: `find_operation` attaches a **compact preview to its top 3
+results only** (writes: required fields + type/enum hints; GET: column names), and
+`describe_operation(method, path)` returns the **full** schema for any one endpoint
+(every body field incl. optional, or the full column set) — the on-demand path for a
+lower-ranked pick or when optional fields are needed. `find_operation`'s default limit
+is **10**. GET columns are derived from the resource's GET-by-id response (the list
+response only advertises the 1–2 default return columns), so they describe the record
+shape, not a guaranteed-filterable set (Simpro doesn't mark filterability). The matcher
+(`getEndpoint` in `catalog.ts`) keys templated index paths against concrete agent paths
+by collapsing `{placeholder}` and numeric id segments to `*`.
 
 ### Key files
 
@@ -200,11 +217,12 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/login.ts` | `npm run login` entry — runs the `authorization_code` browser flow and caches the token without starting the server. |
 | `src/tools.ts` | All MCP tool registrations + helpers (~990 lines; the bulk of the logic). |
 | `src/lineItems.ts` | The 7 cost-center item types: URL segment, required anchor field, supported verbs. |
-| `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
+| `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`, and resolves one endpoint's schema by method+path (`getEndpoint`) for `describe_operation`. |
 | `src/format.ts` | Output shaping: HTML rich-text → compact text/markdown, recursive cleaning. |
 | `src/versionCheck.ts` | Background "newer release available?" check: fetch hosted `version.json`, `compareVersions`, cache + unref'd timer. Fire-and-forget. |
 | `version.json` | The hosted version manifest (`{version, url, notice}`), served by GitHub raw; bump on release. |
-| `data/simpro-api-index.json` | Prebuilt index of ~1,300 endpoints (method/path/summary/tags/params). Ships with the build. |
+| `data/simpro-api-index.json` | Prebuilt index of ~1,300 endpoints (method/path/summary/tags/params **+ body schema for writes, column list for GETs**). Committed; ships with the build. |
+| `scripts/build-index.mjs` | Regenerates the index from the full Swagger spec (in `docs-personal/`, ~24MB, **not** checked in). Run manually via `npm run build-index [spec-path]` after a spec refresh — `npm run build` does **not** run it. |
 | `scripts/copy-data.mjs` | Copies `data/` → `dist/data/` so `dist/` is self-contained in prod. |
 | `tsconfig.test.json` | Test build: compiles `src/` + `test/` to `dist-test/` for `node --test`. |
 
@@ -221,6 +239,16 @@ These are non-obvious and were verified live; the code comments hold the full de
   (`simpro_api_get`) also takes `keywords` + an explicit `keywordColumns` — the passthrough
   can't know a resource's "name" column (Name vs CompanyName vs GivenName/FamilyName vs
   PartNo…), so the agent must name it; `keywords` without `keywordColumns` fails fast.
+- **`searchText` is the real free-text search on `catalogs/` and `prebuilds/`** (and is
+  easily confused with the `search` match scheme above — they're different params). It's a
+  **token-aware wildcard** over name + part number, so it beats `buildSearchQuery`'s `%kw%`
+  substring (which needs the words contiguous — e.g. `searchText=centre line` matches
+  "Single Solid Centre Line", `%centre line%` does not). It is **not in the Swagger spec**
+  (so not in our index), but live-verified 2026-06-23: it filters, a junk term returns
+  `[]` (not silently the whole list), and it composes with `Archived=false`. `find_materials`
+  uses it. When several records share a name, **`Group` (with its `ParentGroup`) is the
+  field that distinguishes them** — it's an org-specific grouping (product category, brand,
+  rate book — varies per Simpro setup), so surface the options rather than guessing.
 - **Trailing-slash routing is load-bearing.** Item routes ending in `/{id}` must have
   **no** trailing slash; collection routes must **have** one. The wrong slash → opaque
   `404 Invalid route`. `normalizePath()` keys off whether the last segment is numeric.

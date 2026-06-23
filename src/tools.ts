@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
 import { SimproClient, SimproError } from "./simproClient.js";
 import { cleanRichText, applyLean } from "./format.js";
-import { searchEndpoints } from "./catalog.js";
+import { searchEndpoints, getEndpoint } from "./catalog.js";
 import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
 import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
 
@@ -563,6 +563,87 @@ export function registerTools(
   );
 
   server.registerTool(
+    "find_materials",
+    {
+      title: "Find Materials (catalog + prebuilds)",
+      description:
+        "Resolve a product name/part number to an ID across BOTH the catalog (stocked materials/parts) AND prebuilds " +
+        "(assemblies) in one call, then say which it is. A name like '100mm solid centre line' could be either, and " +
+        "nothing in the name declares it — so this searches both master collections and tags each match with its " +
+        "`type` ('catalog' or 'prebuild'). That type tells you which line-item endpoint to POST to and which anchor " +
+        "field to use: type 'catalog' -> .../costCenters/{id}/catalogs/ with body { Catalog: <id>, ... }; type " +
+        "'prebuild' -> .../prebuilds/ with body { Prebuild: <id>, ... }. If a term matches in both, you have a genuine " +
+        "ambiguity (a part and an assembly sharing a name) - surface both to the user. Returns id, name, partNo, type " +
+        "and group per match. The same item can appear several times under the SAME name/PartNo in different groups - " +
+        "when that happens, the group is what distinguishes them; surface the options and let the user pick rather than " +
+        "grabbing the first. GET the chosen record for price/UOM/other detail.",
+      inputSchema: {
+        searchText: z
+          .string()
+          .describe("Wildcard search term — matched against name and part number on both collections (Simpro's `searchText` param)."),
+        includeArchived: z.boolean().optional().describe("Include archived records (default false)."),
+        pageSize: z
+          .number()
+          .int()
+          .positive()
+          .max(250)
+          .optional()
+          .describe(`Max rows per collection (max 250; defaults to ${defaultPageSize}).`),
+      },
+      annotations: { title: "Find Materials", readOnlyHint: true },
+    },
+    async ({ searchText, includeArchived, pageSize }) => {
+      try {
+        // `searchText` is Simpro's wildcard search across name/part number — token-aware, so it beats
+        // our buildSearchQuery %...% substring (which needs the words contiguous). Not in the Swagger
+        // spec (so not in our index), but live-verified 2026-06-23: filters on both catalogs/ and
+        // prebuilds/, junk term -> [], composes with Archived=false.
+        const query: Record<string, unknown> = {
+          searchText,
+          columns: ["ID", "Name", "PartNo", "Group"],
+          pageSize: pageSize ?? defaultPageSize,
+        };
+        if (!includeArchived) query.Archived = false;
+
+        const [catalogs, prebuilds] = await Promise.all([
+          client.getList("catalogs/", query),
+          client.getList("prebuilds/", query),
+        ]);
+
+        const tag = (rows: unknown[], type: "catalog" | "prebuild") =>
+          (rows as Array<Record<string, unknown>>).map((r) => {
+            const m: Record<string, unknown> = { id: r.ID, name: r.Name, partNo: r.PartNo, type };
+            if (r.Group !== undefined && r.Group !== null) m.group = r.Group;
+            return m;
+          });
+
+        const matches = [...tag(catalogs.rows, "catalog"), ...tag(prebuilds.rows, "prebuild")];
+
+        // Flag when several matches share a name within a type — the group is what tells them apart.
+        const byName = new Map<string, number>();
+        for (const m of matches) {
+          const key = `${m.type}|${String(m.name).trim().toLowerCase()}`;
+          byName.set(key, (byName.get(key) ?? 0) + 1);
+        }
+        const hasCollision = [...byName.values()].some((n) => n > 1);
+
+        const note =
+          catalogs.rows.length && prebuilds.rows.length
+            ? "Matched in BOTH collections (catalog material and prebuild assembly) — confirm which the user means before adding."
+            : matches.length === 0
+              ? "No matches in either collection. Loosen the search term (a single distinctive word often beats a full phrase)."
+              : hasCollision
+                ? "Several matches share a name — they differ by `group`. Surface the options and let the user pick the right one rather than assuming the first."
+                : undefined;
+
+        return okLean({ matches, note });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
     "customer_aged_receivables",
     {
       title: "Customer Aged Receivables",
@@ -668,30 +749,67 @@ export function registerTools(
     {
       title: "Find Simpro Operation",
       description:
-        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote or line item. Returns matching endpoints with method, path, and parameters. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods.",
+        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote or line item. Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods.",
       inputSchema: {
         query: z.string().describe("What you want to do, in keywords, e.g. 'list customer contacts' or 'update a quote'."),
         method: z
           .enum(["GET", "POST", "PATCH", "PUT", "DELETE"])
           .optional()
           .describe("Optional: restrict to one HTTP method."),
-        limit: z.number().int().positive().max(40).optional().describe("Max results (default 15)."),
+        limit: z.number().int().positive().max(40).optional().describe("Max results (default 10)."),
       },
       annotations: { title: "Find Simpro Operation", readOnlyHint: true, openWorldHint: true },
     },
     async ({ query, method, limit }) => {
       try {
-        const results = searchEndpoints(query, { method, limit }).map((e) => ({
-          method: e.method,
-          path: e.path,
-          summary: e.summary,
-          params: e.params,
-        }));
+        const found = searchEndpoints(query, { method, limit: limit ?? 10 });
+        // Schema preview rides only the top few hits — the agent acts on these, and
+        // attaching it to every result would bloat a search the agent mostly scrolls past.
+        // For a lower-ranked pick, describe_operation fetches the same detail on demand.
+        const PREVIEW_COUNT = 3;
+        const results = found.map((e, i) => {
+          const base = { method: e.method, path: e.path, summary: e.summary, params: e.params };
+          if (i >= PREVIEW_COUNT) return base;
+          if (e.bodyRequired) return { ...base, requiredFields: e.bodyRequired };
+          if (e.columns) return { ...base, columns: Object.keys(e.columns) };
+          return base;
+        });
         if (results.length === 0) return ok({ results: [], note: "No matches. Try different keywords." });
         return ok({
           results,
-          note: "Call simpro_api_get (GET) or simpro_api_post / simpro_api_put / simpro_api_delete (writes) with the chosen path. {companyID} is filled automatically.",
+          note: "Call simpro_api_get (GET) or simpro_api_post / simpro_api_put / simpro_api_delete (writes) with the chosen path. {companyID} is filled automatically. Top results show requiredFields (writes) or columns (GET); for the full schema of any endpoint — including all optional body fields — call describe_operation with its method + path.",
         });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "describe_operation",
+    {
+      title: "Describe Simpro Operation",
+      description:
+        "Get the full schema for one Simpro endpoint (method + path from find_operation). For a write (POST/PUT/PATCH) returns the complete request-body schema — every field with type, required flag, enum values, and ID-hints — so you can build the body without guessing. For a GET returns the full column list of the resource. Use this when find_operation's top-result preview wasn't enough, or you picked a lower-ranked endpoint that had no inline schema.",
+      inputSchema: {
+        method: z.enum(["GET", "POST", "PATCH", "PUT", "DELETE"]).describe("HTTP method of the endpoint."),
+        path: z.string().describe("Endpoint path from find_operation (templated like .../quotes/{quoteID} or a concrete path — {companyID} and ids are matched leniently)."),
+      },
+      annotations: { title: "Describe Simpro Operation", readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ method, path }) => {
+      try {
+        const ep = getEndpoint(method, path);
+        if (!ep) {
+          return fail(new Error(`No endpoint found for ${method} ${path}. Use find_operation to get the exact method + path.`));
+        }
+        const out: Record<string, unknown> = { method: ep.method, path: ep.path, summary: ep.summary };
+        if (ep.body !== undefined) out.body = ep.body;
+        if (ep.columns) out.columns = ep.columns;
+        if (ep.body === undefined && !ep.columns) {
+          out.note = "This endpoint has no body schema or column list in the index (e.g. DELETE, or a path-only operation). Its params: " + (ep.params?.join(", ") ?? "none");
+        }
+        return ok(out);
       } catch (e) {
         return fail(e);
       }

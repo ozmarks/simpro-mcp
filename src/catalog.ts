@@ -8,6 +8,12 @@ export interface Endpoint {
   summary: string;
   tags: string[];
   params: string[];
+  /** Full compacted request-body schema (writes only). */
+  body?: unknown;
+  /** Top-level required body fields with a one-line type/enum hint each (writes only). */
+  bodyRequired?: Record<string, string>;
+  /** Field name -> type/enum hint for the resource's columns (GET only). */
+  columns?: Record<string, string>;
 }
 
 let cache: Endpoint[] | null = null;
@@ -88,4 +94,29 @@ export function searchEndpoints(
     .sort((a, b) => b.score - a.score || a.path.length - b.path.length);
 
   return scored.slice(0, limit);
+}
+
+// Turn an index path or an agent-supplied path into a comparison key: drop the
+// /api/v1.0/companies/{companyID} prefix, the query string and trailing slash, and
+// replace every {placeholder} OR concrete numeric id segment with "*". So the index's
+// ".../quotes/{quoteID}" and the agent's "quotes/123" both key to "quotes/*".
+function pathKey(path: string): string {
+  let rel = path.trim();
+  const m = rel.match(/\/api\/v1\.0\/companies\/[^/]+\/(.*)$/);
+  if (m) rel = m[1];
+  const qIdx = rel.indexOf("?");
+  if (qIdx >= 0) rel = rel.slice(0, qIdx);
+  return rel
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "")
+    .split("/")
+    .map((seg) => (/^\{.+\}$/.test(seg) || /^\d+$/.test(seg) ? "*" : seg))
+    .join("/");
+}
+
+/** Look up one endpoint by method + path (templated or concrete) for describe_operation. */
+export function getEndpoint(method: string, path: string): Endpoint | undefined {
+  const wantMethod = method.toUpperCase();
+  const key = pathKey(path);
+  return load().find((e) => e.method === wantMethod && pathKey(e.path) === key);
 }
