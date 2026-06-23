@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { searchEndpoints } from "../src/catalog.js";
+import { searchEndpoints, getEndpoint } from "../src/catalog.js";
 
 /**
  * Ranking tests for `find_operation`'s endpoint search.
@@ -44,4 +44,31 @@ for (const c of CASES) {
 test("stopword-only query returns nothing rather than everything", () => {
   const results = searchEndpoints("a the to for", {});
   assert.equal(results.length, 0);
+});
+
+// getEndpoint backs describe_operation: it must match the index's templated paths
+// against both templated and concrete (id-filled, prefix-stripped) agent paths.
+test("getEndpoint matches a templated path and exposes the body schema", () => {
+  const ep = getEndpoint("POST", "/api/v1.0/companies/{companyID}/quotes/");
+  assert.ok(ep, "POST quotes/ should be found");
+  assert.deepEqual(ep!.bodyRequired && Object.keys(ep!.bodyRequired).sort(), ["Customer", "Site", "Type"]);
+});
+
+test("getEndpoint matches a concrete id-filled path with the companyID prefix stripped", () => {
+  const ep = getEndpoint("GET", "quotes/123");
+  assert.ok(ep, "GET quotes/123 should map to quotes/{quoteID}");
+  assert.equal(ep!.path, "/api/v1.0/companies/{companyID}/quotes/{quoteID}");
+  assert.ok(ep!.columns && Object.keys(ep!.columns).length > 10, "should carry the full column list");
+});
+
+test("getEndpoint is method-specific", () => {
+  const get = getEndpoint("GET", "quotes/9");
+  const del = getEndpoint("DELETE", "quotes/9");
+  assert.ok(get && del);
+  assert.equal(get!.method, "GET");
+  assert.equal(del!.method, "DELETE");
+});
+
+test("getEndpoint returns undefined for an unknown path", () => {
+  assert.equal(getEndpoint("GET", "this/is/not/a/route"), undefined);
 });

@@ -41,6 +41,9 @@ export interface Config {
   tokenCacheFile: string;
   defaultPageSize: number;
   maxResultBytes: number;
+  version: string;
+  versionCheckUrl: string;
+  versionCheckEnabled: boolean;
   broker?: BrokerConfig;
 }
 
@@ -59,6 +62,7 @@ export interface BrokerConfig {
   sealKey: Buffer;
   staticClients: Map<string, StaticClient>;
   dcrStoreFile: string;
+  refreshGraceTtlMs: number;
 }
 
 function required(name: string): string {
@@ -103,6 +107,21 @@ function resolveStateDir(): string {
   if (existsSync("/data")) return "/data";
   return join(dirname(fileURLToPath(import.meta.url)), "..");
 }
+
+// Single source of truth for the running version: package.json. dist/ sits one level under the
+// package root, so ../package.json resolves in both src (tsc-watch) and dist (prod) layouts.
+function readPackageVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    return typeof pkg.version === "string" && pkg.version ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+const DEFAULT_VERSION_CHECK_URL =
+  "https://raw.githubusercontent.com/ozmarks/simpro-mcp/main/version.json";
 
 function resolveSealKey(): string {
   const fromEnv = process.env.TOKEN_SEAL_KEY;
@@ -180,6 +199,7 @@ function loadBrokerConfig(baseUrl: string): BrokerConfig | undefined {
     sealKey: decodeSealKey(resolveSealKey()),
     staticClients: loadStaticClients(),
     dcrStoreFile: resolveDcrStoreFile(),
+    refreshGraceTtlMs: intEnv("SIMPRO_REFRESH_GRACE_TTL_MS", 600_000),
   };
 }
 
@@ -198,6 +218,9 @@ export function loadConfig(): Config {
     tokenCacheFile: resolveTokenCacheFile(),
     defaultPageSize: intEnv("SIMPRO_DEFAULT_PAGE_SIZE", 50),
     maxResultBytes: intEnv("SIMPRO_MAX_RESULT_BYTES", 100_000),
+    version: readPackageVersion(),
+    versionCheckUrl: process.env.SIMPRO_VERSION_CHECK_URL || DEFAULT_VERSION_CHECK_URL,
+    versionCheckEnabled: (process.env.SIMPRO_VERSION_CHECK ?? "").trim().toLowerCase() !== "off",
     broker: loadBrokerConfig(baseUrl),
   };
 }
