@@ -320,7 +320,7 @@ export function registerTools(
       description:
         "Add a line item to a cost center. Routes to the correct collection for itemType. The result carries `resourceId` — the new line item's id — so a retry that lost the response can confirm-by-id rather than duplicating. Required fields per type — " +
         ITEM_TYPE_KEYS.map((k) => `${k}: ${ITEM_TYPES[k].createHint}`).join("; ") +
-        ". The catalog/labor/prebuild anchor fields take a numeric ID; find_catalog_items resolves a catalog ID from a name or part number.",
+        ". The catalog/labor/prebuild anchor fields take a numeric ID; find_materials resolves a catalog or prebuild ID from a name or part number.",
       inputSchema: {
         ...itemLocator,
         fields: z.record(z.unknown()).describe("Body fields for the new item (see required per type)."),
@@ -529,40 +529,6 @@ export function registerTools(
   );
 
   server.registerTool(
-    "find_catalog_items",
-    {
-      title: "Find Catalog Items",
-      description:
-        "Search the catalog to resolve a catalog item ID by name/part number — typically before add_line_item. " +
-        "Pass `keywords` for free-text matching on Name and PartNo (handled internally as wildcard filters); " +
-        "optionally filter by group or vendor. UOM (unit of measure) is returned; Simpro's catalog data leaves it " +
-        "null on many items — when rows lack it a `_uomNote` flags that the unit is unspecified upstream.",
-      inputSchema: {
-        keywords: z.string().optional().describe("Free-text to match on catalog Name / PartNo. Mapped to wildcard filters internally."),
-        filters: z.record(z.union([z.string(), z.number(), z.boolean()])).optional().describe("Column filters, e.g. { Group: 12 }."),
-        matchScheme: matchSchemeArg,
-        columns: z.array(z.string()).optional(),
-        page: z.number().int().positive().optional(),
-        pageSize: z.number().int().positive().max(250).optional().describe(`Rows per page (max 250; defaults to ${defaultPageSize}). Larger pages risk exceeding the response budget.`),
-      },
-      annotations: { title: "Find Catalog Items", readOnlyHint: true },
-    },
-    async ({ keywords, filters, matchScheme, columns, page, pageSize }) => {
-      try {
-        const result = await client.getList("catalogs/", {
-          columns: columns ?? ["ID", "PartNo", "Name", "TradePrice", "SellPrice", "UOM"],
-          page,
-          pageSize: pageSize ?? defaultPageSize,
-          ...buildSearchQuery(keywords, ["Name", "PartNo"], filters, matchScheme),
-        });
-        return okLean(annotateNullUom(result));
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
-
-  server.registerTool(
     "find_materials",
     {
       title: "Find Materials (catalog + prebuilds)",
@@ -574,9 +540,11 @@ export function registerTools(
         "field to use: type 'catalog' -> .../costCenters/{id}/catalogs/ with body { Catalog: <id>, ... }; type " +
         "'prebuild' -> .../prebuilds/ with body { Prebuild: <id>, ... }. If a term matches in both, you have a genuine " +
         "ambiguity (a part and an assembly sharing a name) - surface both to the user. Returns id, name, partNo, type " +
-        "and group per match. The same item can appear several times under the SAME name/PartNo in different groups - " +
+        "and group per match, plus pricing: catalog matches carry tradePrice, sellPrice and uom (uom is null when " +
+        "unspecified upstream — a note lists those ids); prebuild matches carry totalEx (the assembly's standard " +
+        "build price ex-tax). The same item can appear several times under the SAME name/PartNo in different groups - " +
         "when that happens, the group is what distinguishes them; surface the options and let the user pick rather than " +
-        "grabbing the first. GET the chosen record for price/UOM/other detail.",
+        "grabbing the first.",
       inputSchema: {
         searchText: z
           .string()
@@ -598,26 +566,38 @@ export function registerTools(
         // our buildSearchQuery %...% substring (which needs the words contiguous). Not in the Swagger
         // spec (so not in our index), but live-verified 2026-06-23: filters on both catalogs/ and
         // prebuilds/, junk term -> [], composes with Archived=false.
-        const query: Record<string, unknown> = {
-          searchText,
-          columns: ["ID", "Name", "PartNo", "Group"],
-          pageSize: pageSize ?? defaultPageSize,
-        };
-        if (!includeArchived) query.Archived = false;
+        // TradePrice/SellPrice/UOM (catalog) and TotalEx (prebuild) aren't advertised on the list
+        // endpoints' default columns, but — like Group — are accepted when selected explicitly
+        // (live-verified 2026-06-23). UOM is an object {ID,Name} or null; TotalEx is the prebuild's
+        // standard build price ex-tax. So no per-id follow-up GET is needed for price.
+        const common = ["ID", "Name", "PartNo", "Group"];
+        const base = { searchText, pageSize: pageSize ?? defaultPageSize };
+        const archived = includeArchived ? {} : { Archived: false };
 
         const [catalogs, prebuilds] = await Promise.all([
-          client.getList("catalogs/", query),
-          client.getList("prebuilds/", query),
+          client.getList("catalogs/", { ...base, ...archived, columns: [...common, "TradePrice", "SellPrice", "UOM"] }),
+          client.getList("prebuilds/", { ...base, ...archived, columns: [...common, "TotalEx"] }),
         ]);
 
         const tag = (rows: unknown[], type: "catalog" | "prebuild") =>
           (rows as Array<Record<string, unknown>>).map((r) => {
             const m: Record<string, unknown> = { id: r.ID, name: r.Name, partNo: r.PartNo, type };
             if (r.Group !== undefined && r.Group !== null) m.group = r.Group;
+            if (type === "catalog") {
+              m.tradePrice = r.TradePrice;
+              m.sellPrice = r.SellPrice;
+              m.uom = r.UOM ?? null;
+            } else {
+              m.totalEx = r.TotalEx;
+            }
             return m;
           });
 
         const matches = [...tag(catalogs.rows, "catalog"), ...tag(prebuilds.rows, "prebuild")];
+
+        const nullUomIds = matches
+          .filter((m) => m.type === "catalog" && (m.uom === null || m.uom === undefined))
+          .map((m) => m.id);
 
         // Flag when several matches share a name within a type — the group is what tells them apart.
         const byName = new Map<string, number>();
@@ -627,16 +607,17 @@ export function registerTools(
         }
         const hasCollision = [...byName.values()].some((n) => n > 1);
 
-        const note =
-          catalogs.rows.length && prebuilds.rows.length
-            ? "Matched in BOTH collections (catalog material and prebuild assembly) — confirm which the user means before adding."
-            : matches.length === 0
-              ? "No matches in either collection. Loosen the search term (a single distinctive word often beats a full phrase)."
-              : hasCollision
-                ? "Several matches share a name — they differ by `group`. Surface the options and let the user pick the right one rather than assuming the first."
-                : undefined;
+        const notes: string[] = [];
+        if (catalogs.rows.length && prebuilds.rows.length)
+          notes.push("Matched in BOTH collections (catalog material and prebuild assembly) — confirm which the user means before adding.");
+        else if (matches.length === 0)
+          notes.push("No matches in either collection. Loosen the search term (a single distinctive word often beats a full phrase).");
+        if (hasCollision)
+          notes.push("Several matches share a name — they differ by `group`. Surface the options and let the user pick the right one rather than assuming the first.");
+        if (nullUomIds.length)
+          notes.push(`UOM (unit of measure) is null in Simpro's catalog for ${nullUomIds.length} match(es) (IDs: ${nullUomIds.join(", ")}). The unit is unspecified upstream — don't assume one.`);
 
-        return okLean({ matches, note });
+        return okLean({ matches, note: notes.length ? notes.join(" ") : undefined });
       } catch (e) {
         return fail(e);
       }
@@ -949,24 +930,6 @@ function normalizePath(path: string): string {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
-}
-
-// Simpro's catalog leaves UOM null on many items (data quality, not our bug). When UOM was
-// returned but is null on some rows, attach a note so the agent knows the unit is unspecified
-// upstream rather than assuming "Each". Only fires when UOM is actually a selected column.
-export function annotateNullUom(result: { rows: unknown[]; pagination: unknown }): unknown {
-  const rows = Array.isArray(result.rows) ? (result.rows as Array<Record<string, unknown>>) : [];
-  const uomSelected = rows.some((r) => r && typeof r === "object" && "UOM" in r);
-  if (!uomSelected) return result;
-  const nullUomIds = rows
-    .filter((r) => r && typeof r === "object" && "UOM" in r && (r.UOM === null || r.UOM === undefined || r.UOM === ""))
-    .map((r) => r.ID)
-    .filter((id) => id !== undefined);
-  if (nullUomIds.length === 0) return result;
-  return {
-    ...result,
-    _uomNote: `UOM (unit of measure) is null in Simpro's catalog for ${nullUomIds.length} of these item(s) (IDs: ${nullUomIds.join(", ")}). The unit is unspecified upstream — don't assume one.`,
-  };
 }
 
 // Stock/Assets array names are unconfirmed (absent from probed data); a wrong guess undercounts, never miscounts.

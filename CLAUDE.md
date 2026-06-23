@@ -28,7 +28,7 @@ There is a **test suite** (`npm test`: compiles via `tsconfig.test.json` to
 the pure, deterministic units: `catalog.search` (`find_operation` ranking),
 `format` (HTML cleaning + the lean pass), `lineItems` (item-type map + path
 building), `writeReceipt` (`extractResourceId` header parsing + the `writeReceipt`/
-`footgunHint`/`annotateNullUom` shaping), `versionCheck` (`compareVersions` + the
+`footgunHint` shaping), `versionCheck` (`compareVersions` + the
 fire-and-forget `VersionChecker` against a stubbed fetch + `appendUpdateNotice` latch), and
 `auth/{seal,dcrStore,flowState}` (crypto round-trips, DCR
 registration, flow-store TTL semantics) — no network mocking, so the HTTP client,
@@ -234,8 +234,8 @@ These are non-obvious and were verified live; the code comments hold the full de
   accepts `all` (AND) / `any` (OR). Passing keywords → `422 "Search scheme must be one of
   [\"all\",\"any\"]"` (live-verified). Free-text matching is done with **wildcard column
   filters** (`%kw%`). `buildSearchQuery()` in `tools.ts` encapsulates this — use it; don't
-  pass keywords to `search`. The dedicated finders (`find_work`/`find_customers`/
-  `find_catalog_items`) expose a `keywords` param backed by it. The **generic escape hatch**
+  pass keywords to `search`. The dedicated finders (`find_work`/`find_customers`)
+  expose a `keywords` param backed by it. The **generic escape hatch**
   (`simpro_api_get`) also takes `keywords` + an explicit `keywordColumns` — the passthrough
   can't know a resource's "name" column (Name vs CompanyName vs GivenName/FamilyName vs
   PartNo…), so the agent must name it; `keywords` without `keywordColumns` fails fast.
@@ -289,10 +289,10 @@ These are non-obvious and were verified live; the code comments hold the full de
   and appends the fix to the error. (Per the project decision: clearer errors only, no
   silent translation / strip-lists.) See `ITEM_TYPES.oneOff.createHint`.
 - **Catalog `UOM` is often null** — Simpro's own catalog data, not a bug here (live: many
-  items return `UOM: null`; it's an object `{ID, Name}` when set). `find_catalog_items`
-  returns `UOM` by default and `annotateNullUom()` attaches a `_uomNote` listing the
-  null-UOM ids so the agent knows the unit is unspecified upstream rather than assuming
-  "Each". We do **not** invent a unit — surface the gap only.
+  items return `UOM: null`; it's an object `{ID, Name}` when set). `find_materials` returns
+  `uom` on catalog matches and, when any are null, adds a `note` listing those ids so the
+  agent knows the unit is unspecified upstream rather than assuming "Each". We do **not**
+  invent a unit — surface the gap only.
 
 ## Conventions
 
@@ -304,3 +304,7 @@ These are non-obvious and were verified live; the code comments hold the full de
   marked `eol=lf`; `package-lock.json` is `-diff`.
 - **Never log to stdout** — stdio transport owns it. All diagnostics go to `console.error`.
 - The `dist/` and `node_modules/` dirs and `.env*` (except `.env.example`) are gitignored.
+- **Keep everything generic to Simpro — never industry-specific.** This server targets *any*
+  Simpro business, not the deploying org's trade. When generating tools, examples, comments,
+  or test data, frame them around generic Simpro concepts (jobs, quotes, customers, sites,
+  catalog, line items), never around a particular industry's terminology, workflows, or part types.
