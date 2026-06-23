@@ -31,6 +31,19 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Verify version sync (tag releases only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          manifest=$(node -p "require('./mcpb/manifest.json').version")
+          hosted=$(node -p "require('./version.json').version")
+          echo "tag=$tag package.json=$pkg manifest=$manifest version.json=$hosted"
+          if [ "$pkg" != "$tag" ] || [ "$manifest" != "$tag" ] || [ "$hosted" != "$tag" ]; then
+            echo "::error::Version mismatch — tag $tag, package.json $pkg, manifest.json $manifest, version.json $hosted. Run 'npm run release' to sync, then re-tag."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm ci
 

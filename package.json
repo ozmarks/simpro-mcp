@@ -29,7 +29,8 @@
     "login": "node dist/login.js",
     "dev": "tsc --watch",
     "test": "tsc -p tsconfig.test.json && node scripts/copy-data.mjs dist-test && node --test \"dist-test/test/**/*.test.js\"",
-    "build:mcpb": "node scripts/build-mcpb.mjs"
+    "build:mcpb": "node scripts/build-mcpb.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
