@@ -1,0 +1,44 @@
+name: Tag on release merge
+
+# Tags main when a release PR (branch `release/v*`) merges, which fires
+# release-mcpb.yml to build and publish.
+#
+# The tag is pushed with RELEASE_TOKEN, not the default GITHUB_TOKEN, because a
+# GITHUB_TOKEN push never triggers another workflow — release-mcpb.yml would not
+# run. RELEASE_TOKEN is a fine-grained PAT (or the secret backing a deploy key)
+# scoped to this repo with Contents: write.
+#
+# The version comes from package.json on the merge commit, so the tag always
+# matches the files actually being released, regardless of the branch name.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Tag the merge commit
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::notice::Tag $tag already exists — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$tag"
+          git push origin "$tag"
+          echo "::notice::Pushed $tag — release-mcpb.yml will build and publish."

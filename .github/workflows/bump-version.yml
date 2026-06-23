@@ -1,0 +1,64 @@
+name: Bump version
+
+# Manually bump the version and open a PR with the change.
+#
+# Trigger:
+#   - Actions tab -> "Run workflow" -> choose patch / minor / major (or type an
+#     exact x.y.z). Bumps package.json and syncs mcpb/manifest.json + version.json,
+#     then opens a PR against main.
+#
+# Merging that PR triggers tag-on-release-merge.yml, which tags main and fires
+# release-mcpb.yml — the build and Release are automatic from merge onward.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "patch | minor | major | x.y.z"
+        required: true
+        default: "patch"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Bump version files
+        id: bump
+        run: |
+          version=$(node scripts/release.mjs "${{ inputs.bump }}" --files-only)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          branch="release/v$VERSION"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::error::Branch $branch already exists — v$VERSION may already be in progress."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "Release v$VERSION"
+          git push -u origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Release v$VERSION" \
+            --body "Version bump to **v$VERSION** (package.json, mcpb/manifest.json, version.json).
+
+          Merging this PR tags main and publishes the release automatically."
