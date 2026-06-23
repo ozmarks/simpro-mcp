@@ -497,7 +497,8 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
       description:
         "Search the catalog to resolve a catalog item ID by name/part number — typically before add_line_item. " +
         "Pass `keywords` for free-text matching on Name and PartNo (handled internally as wildcard filters); " +
-        "optionally filter by group or vendor.",
+        "optionally filter by group or vendor. UOM (unit of measure) is returned; Simpro's catalog data leaves it " +
+        "null on many items — when rows lack it a `_uomNote` flags that the unit is unspecified upstream.",
       inputSchema: {
         keywords: z.string().optional().describe("Free-text to match on catalog Name / PartNo. Mapped to wildcard filters internally."),
         filters: z.record(z.union([z.string(), z.number(), z.boolean()])).optional().describe("Column filters, e.g. { Group: 12 }."),
@@ -510,14 +511,13 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     },
     async ({ keywords, filters, matchScheme, columns, page, pageSize }) => {
       try {
-        return okLean(
-          await client.getList("catalogs/", {
-            columns: columns ?? ["ID", "PartNo", "Name", "TradePrice", "SellPrice"],
-            page,
-            pageSize: pageSize ?? defaultPageSize,
-            ...buildSearchQuery(keywords, ["Name", "PartNo"], filters, matchScheme),
-          }),
-        );
+        const result = await client.getList("catalogs/", {
+          columns: columns ?? ["ID", "PartNo", "Name", "TradePrice", "SellPrice", "UOM"],
+          page,
+          pageSize: pageSize ?? defaultPageSize,
+          ...buildSearchQuery(keywords, ["Name", "PartNo"], filters, matchScheme),
+        });
+        return okLean(annotateNullUom(result));
       } catch (e) {
         return fail(e);
       }
@@ -793,6 +793,24 @@ function normalizePath(path: string): string {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+// Simpro's catalog leaves UOM null on many items (data quality, not our bug). When UOM was
+// returned but is null on some rows, attach a note so the agent knows the unit is unspecified
+// upstream rather than assuming "Each". Only fires when UOM is actually a selected column.
+export function annotateNullUom(result: { rows: unknown[]; pagination: unknown }): unknown {
+  const rows = Array.isArray(result.rows) ? (result.rows as Array<Record<string, unknown>>) : [];
+  const uomSelected = rows.some((r) => r && typeof r === "object" && "UOM" in r);
+  if (!uomSelected) return result;
+  const nullUomIds = rows
+    .filter((r) => r && typeof r === "object" && "UOM" in r && (r.UOM === null || r.UOM === undefined || r.UOM === ""))
+    .map((r) => r.ID)
+    .filter((id) => id !== undefined);
+  if (nullUomIds.length === 0) return result;
+  return {
+    ...result,
+    _uomNote: `UOM (unit of measure) is null in Simpro's catalog for ${nullUomIds.length} of these item(s) (IDs: ${nullUomIds.join(", ")}). The unit is unspecified upstream — don't assume one.`,
+  };
 }
 
 // Stock/Assets array names are unconfirmed (absent from probed data); a wrong guess undercounts, never miscounts.

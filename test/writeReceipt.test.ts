@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { extractResourceId } from "../src/simproClient.js";
-import { writeReceipt, footgunHint } from "../src/tools.js";
+import { writeReceipt, footgunHint, annotateNullUom } from "../src/tools.js";
 
 test("extractResourceId reads a numeric Resource-ID header", () => {
   const h = new Headers({ "Resource-ID": "456" });
@@ -58,4 +58,22 @@ test("footgunHint flags a rejected SellPrice write", () => {
 
 test("footgunHint ignores unrelated errors", () => {
   assert.equal(footgunHint({ path: "/Customer", message: "is required" }), undefined);
+});
+
+test("annotateNullUom flags rows whose UOM is null and lists their ids", () => {
+  const out = annotateNullUom({
+    rows: [{ ID: 1, UOM: { ID: 1, Name: "Each" } }, { ID: 2, UOM: null }, { ID: 3, UOM: null }],
+    pagination: { page: 1 },
+  }) as Record<string, unknown>;
+  assert.ok(typeof out._uomNote === "string" && (out._uomNote as string).includes("2, 3"));
+});
+
+test("annotateNullUom is a no-op when every UOM is present", () => {
+  const result = { rows: [{ ID: 1, UOM: { ID: 1, Name: "Each" } }], pagination: { page: 1 } };
+  assert.equal(annotateNullUom(result), result);
+});
+
+test("annotateNullUom is a no-op when UOM was not a selected column", () => {
+  const result = { rows: [{ ID: 1, Name: "x" }], pagination: { page: 1 } };
+  assert.equal(annotateNullUom(result), result);
 });

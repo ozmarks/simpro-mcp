@@ -28,7 +28,7 @@ There is a **test suite** (`npm test`: compiles via `tsconfig.test.json` to
 the pure, deterministic units: `catalog.search` (`find_operation` ranking),
 `format` (HTML cleaning + the lean pass), `lineItems` (item-type map + path
 building), `writeReceipt` (`extractResourceId` header parsing + the `writeReceipt`/
-`footgunHint` shaping), and `auth/{seal,dcrStore,flowState}` (crypto round-trips, DCR
+`footgunHint`/`annotateNullUom` shaping), and `auth/{seal,dcrStore,flowState}` (crypto round-trips, DCR
 registration, flow-store TTL semantics) — no network mocking, so the HTTP client,
 token provider, and broker routes are not unit-tested. No linter or formatter is
 configured. Beyond the unit tests, "verifying" a change still means building and
@@ -238,6 +238,11 @@ These are non-obvious and were verified live; the code comments hold the full de
   POST requests."* — opaque, so `footgunHint()` in `tools.ts` matches the `SellPrice` path
   and appends the fix to the error. (Per the project decision: clearer errors only, no
   silent translation / strip-lists.) See `ITEM_TYPES.oneOff.createHint`.
+- **Catalog `UOM` is often null** — Simpro's own catalog data, not a bug here (live: many
+  items return `UOM: null`; it's an object `{ID, Name}` when set). `find_catalog_items`
+  returns `UOM` by default and `annotateNullUom()` attaches a `_uomNote` listing the
+  null-UOM ids so the agent knows the unit is unspecified upstream rather than assuming
+  "Each". We do **not** invent a unit — surface the gap only.
 
 ## Conventions
 
