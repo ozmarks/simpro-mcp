@@ -2,19 +2,19 @@
   "name": "simpro-mcp-server",
   "version": "0.1.0",
   "private": true,
-  "description": "MCP server exposing Simpro operations (quotes, jobs, customers, catalog, aggregations) over stdio and streamable HTTP",
+  "description": "Unofficial MCP server exposing Simpro operations (quotes, jobs, customers, catalog, aggregations) over stdio and streamable HTTP. Not affiliated with, endorsed by, or supported by Simpro.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ozmarks/simpro-mcp.git"
+    "url": "git+https://github.com/ozmarks/simpro-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/Ozmarks/simpro-mcp/issues"
+    "url": "https://github.com/ozmarks/simpro-mcp/issues"
   },
-  "homepage": "https://github.com/Ozmarks/simpro-mcp#readme",
+  "homepage": "https://github.com/ozmarks/simpro-mcp#readme",
   "bin": {
     "simpro-mcp-server": "./dist/index.js"
   },

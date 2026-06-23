@@ -4,14 +4,14 @@
   "name": "simpro-mcp-server",
   "display_name": "Simpro",
   "version": "0.1.0",
-  "description": "Query and manage Simpro quotes, jobs, customers, catalog, and line items from Claude.",
-  "long_description": "An MCP server that exposes Simpro operations - quotes, jobs, customers, catalog, line items, and cross-collection aggregations to an LLM. Runs locally over stdio. Authenticate with Simpro OAuth (authorization_code via a one-time browser login, or client_credentials) or an API key. Reaches all ~1,300 Simpro endpoints via a generic escape hatch plus a set of guided workflow tools.",
+  "description": "Unofficial Simpro MCP server — query and manage quotes, jobs, customers, catalog, and line items from Claude. Not affiliated with Simpro.",
+  "long_description": "An unofficial MCP server that exposes Simpro operations - quotes, jobs, customers, catalog, line items, and cross-collection aggregations to an LLM. Not affiliated with, endorsed by, or supported by Simpro. Runs locally over stdio. Authenticate with Simpro OAuth (authorization_code via a one-time browser login, or client_credentials) or an API key. Reaches all ~1,300 Simpro endpoints via a generic escape hatch plus a set of guided workflow tools.",
   "author": {
     "name": "Ozmarks Group"
   },
-  "homepage": "https://github.com/Ozmarks/simpro-mcp#readme",
-  "documentation": "https://github.com/Ozmarks/simpro-mcp#readme",
-  "support": "https://github.com/Ozmarks/simpro-mcp/issues",
+  "homepage": "https://github.com/ozmarks/simpro-mcp#readme",
+  "documentation": "https://github.com/ozmarks/simpro-mcp#readme",
+  "support": "https://github.com/ozmarks/simpro-mcp/issues",
   "icon": "icon.png",
   "server": {
     "type": "node",
@@ -91,7 +91,7 @@
     "claude_desktop": ">=1.0.0",
     "platforms": ["darwin", "win32", "linux"],
     "runtimes": {
-      "node": ">=20"
+      "node": ">=24"
     }
   }
 }
