@@ -7,10 +7,8 @@ name: Bump version
 #     exact x.y.z). Bumps package.json and syncs mcpb/manifest.json + version.json,
 #     then opens a PR against main.
 #
-# After the PR merges, tag the merge commit to release:
-#     git tag v<version> && git push --follow-tags
-# (The tag must be pushed with a real credential, not the Actions token — a
-# GITHUB_TOKEN push does not trigger release-mcpb.yml.)
+# Merging that PR triggers tag-on-release-merge.yml, which tags main and fires
+# release-mcpb.yml — the build and Release are automatic from merge onward.
 
 on:
   workflow_dispatch:
@@ -63,7 +61,4 @@ jobs:
             --title "Release v$VERSION" \
             --body "Version bump to **v$VERSION** (package.json, mcpb/manifest.json, version.json).
 
-          After merge, tag to release:
-          \`\`\`
-          git tag v$VERSION && git push --follow-tags
-          \`\`\`"
+          Merging this PR tags main and publishes the release automatically."
