@@ -59,6 +59,7 @@ export interface BrokerConfig {
   sealKey: Buffer;
   staticClients: Map<string, StaticClient>;
   dcrStoreFile: string;
+  refreshGraceTtlMs: number;
 }
 
 function required(name: string): string {
@@ -180,6 +181,7 @@ function loadBrokerConfig(baseUrl: string): BrokerConfig | undefined {
     sealKey: decodeSealKey(resolveSealKey()),
     staticClients: loadStaticClients(),
     dcrStoreFile: resolveDcrStoreFile(),
+    refreshGraceTtlMs: intEnv("SIMPRO_REFRESH_GRACE_TTL_MS", 600_000),
   };
 }
 

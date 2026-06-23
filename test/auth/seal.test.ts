@@ -15,8 +15,8 @@ test("access token round-trips its claims", () => {
 });
 
 test("refresh token round-trips with and without clientId", () => {
-  const withId = { aud: "res", exp: 9, simproRefreshToken: "r", clientId: "c1" };
-  const withoutId = { aud: "res", exp: 9, simproRefreshToken: "r" };
+  const withId = { aud: "res", exp: 9, simproRefreshToken: "r", family: "f1", gen: 0, clientId: "c1" };
+  const withoutId = { aud: "res", exp: 9, simproRefreshToken: "r", family: "f1", gen: 3 };
   assert.deepEqual(unsealRefresh(KEY, sealRefresh(KEY, withId)), withId);
   assert.deepEqual(unsealRefresh(KEY, sealRefresh(KEY, withoutId)), withoutId);
 });
@@ -30,7 +30,7 @@ test("tampering with the ciphertext makes unseal throw", () => {
 
 test("an access token cannot be unsealed as a refresh token, and vice versa", () => {
   const access = sealAccess(KEY, { aud: "res", exp: 1, simproAccessToken: "tok" });
-  const refresh = sealRefresh(KEY, { aud: "res", exp: 1, simproRefreshToken: "r" });
+  const refresh = sealRefresh(KEY, { aud: "res", exp: 1, simproRefreshToken: "r", family: "f1", gen: 0 });
   assert.throws(() => unsealRefresh(KEY, access));
   assert.throws(() => unsealAccess(KEY, refresh));
 });

@@ -113,14 +113,28 @@ modes, selected by `SIMPRO_TRANSPORT`: `stdio` (default), `proxy`, or `broker`.
 - **broker** (`runBrokerHttp`, `src/auth/`): an OAuth 2.0 broker in front of
   Simpro for the Claude connector, on **Express**. Serves the unauthenticated
   metadata + `/authorize` + `/callback` + `/token` routes and a bearer-guarded
-  `/mcp`. Token model is a **stateless encrypted envelope** (`seal.ts`,
+  `/mcp`. Token model is an **encrypted envelope** (`seal.ts`,
   AES-256-GCM, `TOKEN_SEAL_KEY`): the broker issues its own tokens to Claude with
-  the Simpro tokens sealed inside — no token store. `requireBearerAuth`'s verifier
+  the Simpro tokens sealed inside. `requireBearerAuth`'s verifier
   unseals the access token, checks aud/exp, and exposes the Simpro access token via
   `AuthInfo.extra`, which then drives the same passthrough `SimproClient`. The
-  broker enforces PKCE locally (Simpro does none) and posts JSON to Simpro's token
-  endpoint. Flow correlation is a short-TTL in-process `Map` (`flowState.ts`) —
-  **single-instance only; do not load-balance**. Client identity has **three
+  access path is stateless; the **refresh path is not**, because **Simpro rotates
+  refresh tokens on use** (each `refresh_token` grant burns the presented token and
+  returns a new one). A purely-stateless envelope can't survive that — a client that
+  drops our refresh response keeps an envelope carrying the now-burned upstream token
+  and its next refresh 400s `invalid_grant`. So a **short-TTL in-memory grace buffer**
+  (`refreshFamilies.ts`, `SIMPRO_REFRESH_GRACE_TTL_MS`, default 10 min) holds the
+  *current* upstream refresh token per grant **family** (a random id minted at
+  `authorization_code`, sealed into every refresh envelope alongside a monotonic
+  `gen`). On refresh, `decideRefreshToken` compares the envelope's `gen` to the
+  buffered one: caught-up → use the envelope's token; one-step-stale (dropped response)
+  → net it via the buffered token; >1 generation stale → `invalid_grant`. Pre-upgrade
+  envelopes (no `family`) reject once → one re-auth. The buffer is depth-1 (one write
+  site, `record`, which is retire-confirmed + stash-new atomically) and
+  **single-instance, in-memory** — a restart only costs the in-flight-and-unconfirmed
+  refreshes one re-auth. Concurrent double-fires retry-on-conflict once rather than
+  fail. Flow correlation is a short-TTL in-process `Map` (`flowState.ts`) —
+  **single-instance only; do not load-balance** (the grace buffer reinforces this). Client identity has **three
   coexisting schemes**, resolved at `/authorize` in order: a configured **static
   client** (`STATIC_CLIENTS`, confidential, `client_secret_post`), a runtime
   **DCR** client (`dcrStore.ts`, RFC 7591, open `/register`, persisted to
@@ -172,6 +186,7 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/config.ts` | Dependency-free `.env` loader + `loadConfig()`. Precedence: existing env → `$SIMPRO_ENV_FILE` → repo-root `.env`. |
 | `src/simproClient.ts` | HTTP client: URL building, rate limiter, 429 retry, pagination, async token resolution (bearer / OAuth provider / api-key) + 401 refresh-retry. |
 | `src/auth/simproToken.ts` | The shared Simpro token contract (`fetchSimproToken`) + the stdio `ClientCredentialsProvider`. Used by the broker and stdio. |
+| `src/auth/refreshFamilies.ts` | Broker rotation grace buffer: in-memory `{family → current Simpro refresh token}` + the pure `decideRefreshToken` table. Survives Simpro's refresh-token rotation across dropped responses. |
 | `src/auth/authCodeProvider.ts` | stdio `authorization_code` provider: refresh-token cache (`.simpro-tokens.json`) + lazy re-auth via the browser flow. |
 | `src/auth/authCodeFlow.ts` | One-time browser login over a fixed-port localhost callback; returns the Simpro refresh token. |
 | `src/login.ts` | `npm run login` entry — runs the `authorization_code` browser flow and caches the token without starting the server. |
@@ -215,6 +230,14 @@ These are non-obvious and were verified live; the code comments hold the full de
   10/s ceiling makes scaling out pointless. Simpro sends no `Retry-After`/rate-limit
   headers, so 429 uses our own exponential backoff with jitter (capped under
   Cowork's 30s/call budget).
+- **Refresh tokens are single-use and rotate** (live-verified). Every Simpro
+  `refresh_token` grant returns a **new** refresh token and immediately invalidates the
+  one presented — replaying a spent token → `400 invalid_grant "Invalid refresh token"`.
+  This bites the broker, whose refresh token is a stateless sealed envelope: a client
+  that drops our refresh response keeps an envelope holding the now-burned upstream token,
+  so its next refresh dies and the agent sees the session vanish. The **grace buffer**
+  (`auth/refreshFamilies.ts`, see the broker section above) is what makes this survivable
+  — don't remove it, and don't assume the envelope alone can carry refresh state.
 - **`oneOff` sell price**: write `SellPriceExDiscount` (number) or
   `EstimatedCost`+`Markup`; never POST `SellPrice: { ExTax }` (that's the read shape →
   422). See `ITEM_TYPES.oneOff.createHint`.

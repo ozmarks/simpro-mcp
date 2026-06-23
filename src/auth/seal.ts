@@ -13,6 +13,10 @@ export interface RefreshTokenClaims {
   aud: string;
   exp: number;
   simproRefreshToken: string;
+  /** Stable per-grant id, minted at authorization_code time. Keys the rotation grace buffer. */
+  family: string;
+  /** 0 at first issue, +1 each rotation. Lets the broker tell a stale envelope from a current one. */
+  gen: number;
   /** client_id when issued to a confidential static client; absent for CIMD. */
   clientId?: string;
 }
