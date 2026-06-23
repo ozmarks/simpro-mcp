@@ -13,6 +13,9 @@ import {
 } from "./seal.js";
 import { fetchSimproToken, type SimproTokenResponse } from "./simproToken.js";
 import { RateLimiter } from "./rateLimit.js";
+import { RefreshFamilyStore, decideRefreshToken } from "./refreshFamilies.js";
+import { randomBytes } from "node:crypto";
+import { SimproError } from "../simproClient.js";
 
 function log(line: string): void {
   console.error(`  broker ${line}`);
@@ -99,9 +102,20 @@ export function unsealForRequest(cfg: BrokerConfig, token: string): BrokerVerify
 // Caps replay window for a leaked refresh token — the envelope is stateless (no revocation list).
 const REFRESH_TTL_SEC = 30 * 24 * 60 * 60;
 
-function sealPair(cfg: BrokerConfig, t: SimproTokenResponse, clientId?: string) {
+function sealPair(
+  cfg: BrokerConfig,
+  families: RefreshFamilyStore,
+  t: SimproTokenResponse,
+  family: string,
+  gen: number,
+  clientId?: string,
+) {
   const now = Math.floor(Date.now() / 1000);
   const claims: AccessTokenClaims = { aud: cfg.resourceUrl, exp: now + t.expires_in, simproAccessToken: t.access_token };
+  // Stash the freshly-rotated upstream token before handing the envelope to the client,
+  // so a dropped response can still be netted on the next refresh. This is the buffer's
+  // only write site — overwrite = retire-confirmed + stash-new, atomically.
+  families.record(family, gen, t.refresh_token ?? "");
   return {
     access_token: sealAccess(cfg.sealKey, claims),
     token_type: "Bearer",
@@ -110,6 +124,8 @@ function sealPair(cfg: BrokerConfig, t: SimproTokenResponse, clientId?: string) 
       aud: cfg.resourceUrl,
       exp: now + REFRESH_TTL_SEC,
       simproRefreshToken: t.refresh_token ?? "",
+      family,
+      gen,
       ...(clientId ? { clientId } : {}),
     }),
   };
@@ -119,6 +135,7 @@ export function brokerRouter(cfg: BrokerConfig): express.Router {
   const r = express.Router();
   const flows = new FlowStore();
   const dcr = new DcrStore(cfg.dcrStoreFile);
+  const families = new RefreshFamilyStore(cfg.refreshGraceTtlMs);
   const u = (p: string) => `${cfg.publicUrl}${p}`;
 
   // /register persists (whole-file rewrite) and evicts at its cap, so it gets the
@@ -257,8 +274,9 @@ export function brokerRouter(cfg: BrokerConfig): express.Router {
           return res.status(401).json({ error: "invalid_client" });
         }
         const simpro = await simproToken(cfg, { grant_type: "authorization_code", code: pending.simproCode });
+        const family = randomBytes(16).toString("base64url");
         log("/token authorization_code -> sealed pair issued");
-        return res.json(sealPair(cfg, simpro, pending.confidential ? pending.clientId : undefined));
+        return res.json(sealPair(cfg, families, simpro, family, 0, pending.confidential ? pending.clientId : undefined));
       }
 
       if (grant === "refresh_token") {
@@ -277,9 +295,42 @@ export function brokerRouter(cfg: BrokerConfig): express.Router {
           log("/token refresh invalid_client (bad/missing secret)");
           return res.status(401).json({ error: "invalid_client" });
         }
-        const simpro = await simproToken(cfg, { grant_type: "refresh_token", refresh_token: inner.simproRefreshToken });
+        if (!inner.family) {
+          // Envelope minted before the grace-buffer upgrade — no family to key the buffer.
+          // One re-auth clears it; absorbing it gracefully isn't possible (the token may
+          // already be rotated past us with nothing buffered).
+          log("/token refresh invalid_grant (pre-upgrade token, no family)");
+          return res.status(400).json({ error: "invalid_grant" });
+        }
+
+        const decision = decideRefreshToken(families.get(inner.family), inner);
+        if (decision.kind === "reject") {
+          log(`/token refresh invalid_grant (${decision.reason})`);
+          return res.status(400).json({ error: "invalid_grant" });
+        }
+        if (decision.recovered) log(`/token refresh recovered via grace buffer (gen ${inner.gen} -> ${decision.newGen})`);
+
+        let simpro: SimproTokenResponse;
+        let newGen = decision.newGen;
+        try {
+          simpro = await simproToken(cfg, { grant_type: "refresh_token", refresh_token: decision.token });
+        } catch (e) {
+          // A concurrent refresh on this family may have rotated the upstream token out
+          // from under us (double-fire). Re-read the buffer once; if a newer gen now
+          // exists, retry against it rather than failing the client.
+          if (e instanceof SimproError && e.status === 400) {
+            // decision.newGen-1 is the gen we just tried to spend; a buffer now beyond it
+            // means a concurrent refresh rotated underneath us. Retry against the winner.
+            const fresh = families.get(inner.family);
+            if (fresh && fresh.gen >= decision.newGen) {
+              log(`/token refresh retry after concurrent rotation (gen -> ${fresh.gen + 1})`);
+              simpro = await simproToken(cfg, { grant_type: "refresh_token", refresh_token: fresh.simproRefreshToken });
+              newGen = fresh.gen + 1;
+            } else throw e;
+          } else throw e;
+        }
         log("/token refresh -> rotated sealed pair issued");
-        return res.json(sealPair(cfg, simpro, inner.clientId));
+        return res.json(sealPair(cfg, families, simpro, inner.family, newGen, inner.clientId));
       }
 
       return res.status(400).json({ error: "unsupported_grant_type" });
