@@ -26,14 +26,31 @@ function okWithBudget(data: unknown, maxBytes = Number.POSITIVE_INFINITY, doLean
   }
   return { content: [{ type: "text" as const, text }] };
 }
+export type SimproFieldError = { path?: string; message?: string; value?: unknown };
+
+// Known Simpro footguns where the raw 422 path/message is opaque. Maps a matched error to a
+// concrete fix hint so the agent self-corrects (per the "clearer errors, no silent translation" rule).
+export function footgunHint(e: SimproFieldError): string | undefined {
+  const path = (e.path ?? "").toLowerCase();
+  // Live: POSTing SellPrice.ExTax → path "/SellPrice/ExTax", message "This API Column does not allow POST requests."
+  if (path.includes("sellprice")) {
+    return "SellPrice is a read-only shape ({ ExTax, IncTax }) and can't be written. To set a one-off's price, send SellPriceExDiscount (a number) for an exact sell, or EstimatedCost + Markup.";
+  }
+  return undefined;
+}
+
 function fail(err: unknown) {
   let msg: string;
   if (err instanceof SimproError) {
-    const body = err.body as { errors?: Array<{ path?: string; message?: string; value?: unknown }> } | undefined;
+    const body = err.body as { errors?: SimproFieldError[] } | undefined;
     if (body?.errors?.length) {
-      const lines = body.errors.map(
-        (e) => `  - ${e.path ?? "(root)"}: ${e.message}${e.value !== undefined && e.value !== null ? ` (got: ${JSON.stringify(e.value)})` : ""}`,
-      );
+      const lines = body.errors.map((e) => {
+        const hint = footgunHint(e);
+        return (
+          `  - ${e.path ?? "(root)"}: ${e.message}${e.value !== undefined && e.value !== null ? ` (got: ${JSON.stringify(e.value)})` : ""}` +
+          (hint ? `\n    → ${hint}` : "")
+        );
+      });
       msg = `${err.message}\n${lines.join("\n")}`;
     } else {
       msg = `${err.message}${err.body ? `\n${JSON.stringify(err.body)}` : ""}`;
@@ -79,10 +96,33 @@ function buildSearchQuery(
   return q;
 }
 
+// Shape a write result so it always carries the resource id Simpro reported (from the Location /
+// Resource-ID header). On a 204 (no body) this is the only id the agent gets back; on a 200/201
+// the id is surfaced alongside the body so a client that lost the socket can confirm-by-id.
+export function writeReceipt(body: unknown, resourceId: string | number | undefined): unknown {
+  if (resourceId === undefined) return body;
+  if (body === undefined) return { success: true, resourceId };
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const rec = body as Record<string, unknown>;
+    return rec.resourceId === undefined ? { ...rec, resourceId } : rec;
+  }
+  return { resourceId, result: body };
+}
+
 export function registerTools(server: McpServer, client: SimproClient, cfg: Config): void {
   const defaultPageSize = cfg.defaultPageSize;
   const ok = (data: unknown) => okWithBudget(data, cfg.maxResultBytes, false);
   const okLean = (data: unknown) => okWithBudget(data, cfg.maxResultBytes, true);
+
+  // POST/PUT/PATCH/DELETE through one path that echoes the resource id as a receipt.
+  const okWrite = async (
+    method: "POST" | "PUT" | "PATCH" | "DELETE",
+    path: string,
+    opts: { body?: unknown; query?: Record<string, unknown>; mergeMode?: boolean } = {},
+  ) => {
+    const { body, resourceId } = await client.requestWithReceipt(method, path, opts);
+    return ok(writeReceipt(body, resourceId));
+  };
 
   server.registerTool(
     "find_work",
@@ -165,14 +205,9 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     },
     async ({ entity, customer, site, type, fields }) => {
       try {
-        return ok(
-          await client.post(`${base(entity)}/`, {
-            Customer: customer,
-            Site: site,
-            Type: type,
-            ...(fields ?? {}),
-          }),
-        );
+        return await okWrite("POST", `${base(entity)}/`, {
+          body: { Customer: customer, Site: site, Type: type, ...(fields ?? {}) },
+        });
       } catch (e) {
         return fail(e);
       }
@@ -245,7 +280,7 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     {
       title: "Add Line Item",
       description:
-        "Add a line item to a cost center. Routes to the correct collection for itemType. Required fields per type — " +
+        "Add a line item to a cost center. Routes to the correct collection for itemType. The result carries `resourceId` — the new line item's id — so a retry that lost the response can confirm-by-id rather than duplicating. Required fields per type — " +
         ITEM_TYPE_KEYS.map((k) => `${k}: ${ITEM_TYPES[k].createHint}`).join("; ") +
         ". The catalog/labor/prebuild anchor fields take a numeric ID; find_catalog_items resolves a catalog ID from a name or part number.",
       inputSchema: {
@@ -257,7 +292,41 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     async ({ entity, id, sectionID, costCenterID, itemType, fields }) => {
       try {
         const path = itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType);
-        return ok(await client.post(path, fields));
+        return await okWrite("POST", path, { body: fields });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  const updatableTypes = ITEM_TYPE_KEYS.filter((k) => ITEM_TYPES[k].canUpdate);
+  server.registerTool(
+    "update_line_item",
+    {
+      title: "Update Line Item",
+      description:
+        "Update one existing line item in place (PATCH — only the fields you pass change). Routes to the correct collection for itemType; `itemID` is the line item's own id (from list_line_items), not its catalog/anchor id. " +
+        `Updatable types: ${updatableTypes.join(", ")}. ` +
+        "assets have no update endpoint — delete and re-add instead. " +
+        "Common edits: Qty via fields.Total ({ Qty }); a oneOff's sell price via fields.SellPriceExDiscount (number) — never POST SellPrice: { ExTax } (read-only shape). To change a line's catalog/labor/prebuild item, delete it and add the new one rather than swapping the anchor.",
+      inputSchema: {
+        ...itemLocator,
+        itemID: z.number().int().positive().describe("The line item's own ID (from list_line_items), i.e. the id under the cost center's item collection."),
+        fields: z.record(z.unknown()).describe("Fields to change (PATCH semantics — omit what stays the same)."),
+      },
+      annotations: { title: "Update Line Item", readOnlyHint: false },
+    },
+    async ({ entity, id, sectionID, costCenterID, itemType, itemID, fields }) => {
+      try {
+        if (!ITEM_TYPES[itemType as ItemType].canUpdate) {
+          return fail(
+            new Error(
+              `Item type '${itemType}' has no Simpro update endpoint. Delete the line and re-add it (use simpro_api_delete then add_line_item).`,
+            ),
+          );
+        }
+        const path = `${itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType)}${itemID}`;
+        return await okWrite("PATCH", path, { body: fields });
       } catch (e) {
         return fail(e);
       }
@@ -319,7 +388,7 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
             : from === "quote"
               ? `quotes/${id}/convert/`
               : `recurringJobs/${id}/createJob/`;
-        return ok(await client.post(path, undefined));
+        return await okWrite("POST", path);
       } catch (e) {
         return fail(e);
       }
@@ -346,7 +415,7 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
         const b = base(entity);
         const src = (await client.get(`${b}/${id}`, { display: "all" })) as Record<string, any>;
         const body = buildDuplicateBody(entity, src, { intoCustomer, name });
-        return ok(await client.post(`${b}/`, body));
+        return await okWrite("POST", `${b}/`, { body });
       } catch (e) {
         return fail(e);
       }
@@ -596,18 +665,27 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     {
       title: "Simpro API GET",
       description:
-        "Read from any Simpro REST API GET endpoint (paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Covers reads in areas without a dedicated tool. Use simpro_api_post / simpro_api_put / simpro_api_delete for writes.",
+        "Read from any Simpro REST API GET endpoint (paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Covers reads in areas without a dedicated tool. " +
+        "Free-text filtering on a Simpro list is NOT done via the `search` param — that param only takes 'all'/'any' (a match scheme); passing words 422s. To match free text, use a wildcard column filter: query: { Name: '%court%' }. " +
+        "For convenience pass `keywords` + `keywordColumns` and this wraps each column in %…% for you (e.g. keywords:'court', keywordColumns:['Name'] → Name='%court%'). You must name the column(s) — the right one varies by resource (Name, CompanyName, GivenName/FamilyName, PartNo, Description, …); inspect a row or find_operation params if unsure. Not every column is filterable. " +
+        "Use simpro_api_post / simpro_api_put / simpro_api_delete for writes.",
       inputSchema: {
         path: z
           .string()
           .describe("Endpoint path. Catalog form with {companyID} (auto-filled) or a concrete /api/v1.0/... path."),
-        query: z.record(z.unknown()).optional().describe("Query params (search, columns, pageSize, filters, …)."),
+        query: z.record(z.unknown()).optional().describe("Query params (columns, pageSize, page, orderby, and exact/operator column filters like { Stage: 'Pending', Total: 'gt(5000)' }). `search` here is the match scheme 'all'/'any' only, not free text."),
+        keywords: z.string().optional().describe("Free text to match. Requires keywordColumns. Wrapped as %keywords% on each named column; multiple columns default to OR (search=any)."),
+        keywordColumns: z.array(z.string()).optional().describe("Column(s) the keywords match against — e.g. ['Name'] or ['GivenName','FamilyName']. You pick these; the passthrough can't know a resource's 'name' column."),
       },
       annotations: { title: "Simpro API GET", readOnlyHint: true, openWorldHint: true },
     },
-    async ({ path, query }) => {
+    async ({ path, query, keywords, keywordColumns }) => {
       try {
-        return okLean(await client.request("GET", normalizePath(path), { query }));
+        if (keywords?.trim() && !(keywordColumns && keywordColumns.length)) {
+          return fail(new Error("keywords requires keywordColumns — name the column(s) to match (e.g. ['Name']). The passthrough can't guess a resource's name column."));
+        }
+        const q = buildSearchQuery(keywords, keywordColumns ?? [], query as Record<string, unknown> | undefined, undefined);
+        return okLean(await client.request("GET", normalizePath(path), { query: q }));
       } catch (e) {
         return fail(e);
       }
@@ -633,7 +711,7 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     {
       title: "Simpro API POST / PATCH (write)",
       description:
-        "Create or partially update via the Simpro REST API (POST and PATCH; paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Mutates real data in the connected Simpro account. Use simpro_api_put to replace, simpro_api_delete to remove, simpro_api_get to read.",
+        "Create or partially update via the Simpro REST API (POST and PATCH; paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Mutates real data in the connected Simpro account. The result carries `resourceId` — the id Simpro assigned/updated — so a retry that lost the response can confirm-by-id instead of re-creating. Use simpro_api_put to replace, simpro_api_delete to remove, simpro_api_get to read.",
       inputSchema: {
         method: z.enum(["POST", "PATCH"]).optional().describe("POST (create) or PATCH (partial update). Defaults to POST."),
         path: writePath,
@@ -644,7 +722,7 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     },
     async ({ method, path, query, body }) => {
       try {
-        return ok(await client.request(method ?? "POST", normalizePath(path), { query, body }));
+        return await okWrite(method ?? "POST", normalizePath(path), { query, body });
       } catch (e) {
         return fail(e);
       }
@@ -666,7 +744,7 @@ export function registerTools(server: McpServer, client: SimproClient, cfg: Conf
     },
     async ({ path, query, body }) => {
       try {
-        return ok(await client.request("PUT", normalizePath(path), { query, body }));
+        return await okWrite("PUT", normalizePath(path), { query, body });
       } catch (e) {
         return fail(e);
       }
