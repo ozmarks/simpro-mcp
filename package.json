@@ -1,6 +1,6 @@
 {
   "name": "simpro-mcp-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Unofficial MCP server exposing Simpro operations (quotes, jobs, customers, catalog, aggregations) over stdio and streamable HTTP. Not affiliated with, endorsed by, or supported by Simpro.",
   "type": "module",
