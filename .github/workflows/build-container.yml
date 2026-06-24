@@ -3,12 +3,16 @@ name: Build container
 # Builds the server image and pushes it to GitHub Container Registry (GHCR).
 #
 # Trigger:
-#   - Manual run only (Actions tab -> "Run workflow"). No scheduled or push runs.
+#   - Push a version tag (`v*`) -> builds and publishes the release image.
+#   - Manual run (Actions tab -> "Run workflow").
 #
 # The image is published to ghcr.io/<owner>/<repo>, tagged with the short commit
-# SHA and `latest`.
+# SHA, `latest`, and the version tag (e.g. `0.2.0`) on tag pushes.
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -37,6 +41,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=sha,format=short
+            type=semver,pattern={{version}}
             type=raw,value=latest
 
       - name: Build and push
