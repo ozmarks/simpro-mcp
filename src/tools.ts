@@ -5,6 +5,7 @@ import { SimproClient, SimproError } from "./simproClient.js";
 import { cleanRichText, applyLean } from "./format.js";
 import { searchEndpoints, getEndpoint } from "./catalog.js";
 import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
+import { selectRecords, columnsForFields, describeRecord } from "./select.js";
 import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
 
 // One-line agent-facing update notice (stdio surfaces it on a tool result; HTTP logs it instead).
@@ -639,11 +640,12 @@ export function registerTools(
     },
     async ({ customerID, asOf }) => {
       try {
-        const rows = (await client.getAllPages("invoices/", {
-          "Customer.ID": customerID,
-          IsPaid: false,
-          columns: ["ID", "DateIssued", "PaymentTerms", "Total"],
-        })) as Array<Record<string, any>>;
+        const { rows } = await fetchProjected(
+          client,
+          "invoices/",
+          ["ID", "DateIssued", "PaymentTerms.DueDate", "PaymentTerms.Days", "Total.BalanceDue"],
+          { filters: { "Customer.ID": customerID, IsPaid: false }, allPages: true },
+        );
         return ok(ageReceivables(rows, asOf, customerID));
       } catch (e) {
         return fail(e);
@@ -667,10 +669,12 @@ export function registerTools(
     },
     async ({ staffID, dateFrom, dateTo }) => {
       try {
-        const rows = (await client.getAllPages("schedules/", {
-          "Staff.ID": staffID,
-          Date: `between(${dateFrom},${dateTo})`,
-        })) as Array<Record<string, any>>;
+        const { rows } = await fetchProjected(
+          client,
+          "schedules/",
+          ["ID", "Date", "TotalHours", "Reference", "Blocks"],
+          { filters: { "Staff.ID": staffID, Date: `between(${dateFrom},${dateTo})` }, allPages: true },
+        );
         const totalHours = rows.reduce((s, r) => s + (Number(r.TotalHours) || 0), 0);
         return ok({ staffID, dateFrom, dateTo, count: rows.length, totalHours, schedules: rows });
       } catch (e) {
@@ -695,24 +699,20 @@ export function registerTools(
       try {
         // Sequential to respect the shared rate limit; each is one cheap call.
         const customer = await getCustomerAny(client, customerID);
-        const openQuotes = await client.get("quotes/", {
-          "Customer.ID": customerID,
-          Stage: "in(InProgress,Complete)",
-          columns: ["ID", "Name", "Stage", "Status", "Total", "DateIssued"],
+        const workFields = ["ID", "Name", "Stage", "Status", "Total.ExTax", "DateIssued"];
+        const openQuotes = await fetchProjected(client, "quotes/", workFields, {
+          filters: { "Customer.ID": customerID, Stage: "in(InProgress,Complete)" },
           pageSize: 50,
         });
-        const openJobs = await client.get("jobs/", {
-          "Customer.ID": customerID,
-          Stage: "in(Pending,Progress)",
-          columns: ["ID", "Name", "Stage", "Status", "Total", "DateIssued"],
+        const openJobs = await fetchProjected(client, "jobs/", workFields, {
+          filters: { "Customer.ID": customerID, Stage: "in(Pending,Progress)" },
           pageSize: 50,
         });
-        const unpaid = (await client.getAllPages("invoices/", {
-          "Customer.ID": customerID,
-          IsPaid: false,
-          columns: ["ID", "Total"],
-        })) as Array<Record<string, any>>;
-        const outstanding = unpaid.reduce((s, i) => s + (Number(i?.Total?.BalanceDue) || 0), 0);
+        const { rows: unpaid } = await fetchProjected(client, "invoices/", ["ID", "Total.BalanceDue"], {
+          filters: { "Customer.ID": customerID, IsPaid: false },
+          allPages: true,
+        });
+        const outstanding = unpaid.reduce((s, i) => s + (Number((i.Total as any)?.BalanceDue) || 0), 0);
         return ok({
           customer,
           openQuotes,
@@ -829,6 +829,112 @@ export function registerTools(
     },
   );
 
+  server.registerTool(
+    "query_collection",
+    {
+      title: "Query Collection (multi-record field select)",
+      description:
+        "Fetch many records from any Simpro list (GET-multiple) endpoint and return ONLY the dot-path fields you ask for — across nested levels. Built for cross-record rollups (e.g. cost-centre $ totals over many jobs) without dumping whole records to the model. " +
+        "Each `field` is the full path from the record root, e.g. 'ID', 'Total.ExTax', 'Sections.CostCenters.Total.ExTax'. " +
+        "Simpro can only select TOP-LEVEL columns, so this requests those (with display=all to expand them) and narrows to your exact sub-paths itself. " +
+        "When fields cross an array (e.g. Sections→CostCenters), the record FANS OUT to one row per leaf-most element, with the record-level fields repeated on each row. Rows are returned NESTED (the path is rebuilt into a tree), so a shared prefix like Sections.CostCenters is stated once per row, not on every key; a job 'ID' at the root and a cost-centre 'ID' under Sections.CostCenters sit at different depths and never collide. Each array level the fields descend through also carries its own 'ID' automatically (where the elements have one), so every fanned-out level is identifiable. " +
+        "A field that NAMES an array directly (e.g. 'Blocks') returns that whole array as the value — no fan-out; only naming a sub-path INTO it (e.g. 'Blocks.Hrs') fans out one row per element. " +
+        "Returns one page as { collection, rows, pagination }; `collection` echoes the queried path so you know what the root 'ID' on each row identifies (e.g. collection 'jobs' → the root 'ID' is the job's). Request later pages with `page`. " +
+        "Note: display=all expands sell-side values (Total/SellPrice/Claimed) at every level, but the cost/margin `Totals` object is NOT expandable into nested arrays — it exists only at the record top level (job 'Totals') and on the cost-centre resource itself. For per-cost-centre cost/margin you must read each cost centre directly.",
+      inputSchema: {
+        path: z
+          .string()
+          .describe("A collection (GET-multiple) path, e.g. 'jobs/', 'quotes/', 'customers/companies/', 'catalogs/'. {companyID} is auto-filled."),
+        fields: z
+          .array(z.string())
+          .min(1)
+          .describe("Full dot-paths to return, from the record root. Nested + array-crossing allowed, e.g. ['ID','Name','Sections.CostCenters.Name','Sections.CostCenters.Total.ExTax']. The deepest array crossed defines the row granularity."),
+        filters: z
+          .record(z.unknown())
+          .optional()
+          .describe("Server-side column filters { Column: value }; supports operators (gt(), between(), in()) and nested columns (Customer.ID). Property names are case-sensitive (ID, not id)."),
+        keywords: z.string().optional().describe("Free text to match. Requires keywordColumns. Wrapped as %keywords% on each named column."),
+        keywordColumns: z.array(z.string()).optional().describe("Column(s) the keywords match against (e.g. ['Name']). You pick these; the right one varies by resource."),
+        matchScheme: matchSchemeArg,
+        page: z.number().int().positive().optional(),
+        pageSize: z.number().int().positive().max(250).optional().describe(`Records (not rows) per page (max 250; defaults to ${defaultPageSize}). One record can fan out to many rows.`),
+        orderby: z.array(z.string()).optional().describe("e.g. ['-ID'] for newest first."),
+      },
+      annotations: { title: "Query Collection", readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ path, fields, filters, keywords, keywordColumns, matchScheme, page, pageSize, orderby }) => {
+      try {
+        if (keywords?.trim() && !(keywordColumns && keywordColumns.length)) {
+          return fail(new Error("keywords requires keywordColumns — name the column(s) to match (e.g. ['Name'])."));
+        }
+        const q: Record<string, unknown> = {
+          columns: columnsForFields(fields),
+          display: "all",
+          page,
+          pageSize: pageSize ?? defaultPageSize,
+          orderby,
+          ...buildSearchQuery(keywords, keywordColumns ?? [], filters as Record<string, unknown> | undefined, matchScheme),
+        };
+        const { rows, pagination } = await client.getList(normalizePath(path), q);
+        const collection = path.replace(/^\/+|\/+$/g, "");
+        return okLean({ collection, rows: selectRecords(rows, fields), pagination });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "describe_collection",
+    {
+      title: "Describe Collection Fields",
+      description:
+        "Discover the selectable dot-path fields for query_collection on a given collection. Fetches one live record (display=all) and returns its full queryable model: every field as a full dot-path from the record root (e.g. 'Sections.CostCenters.Total.ExTax'), its type, and an `array: true` flag where a path passes THROUGH an array (so selecting a sub-path fans out one row per element). An array node itself (e.g. 'Blocks', type:'array') can be selected directly to get the whole array as one value; selecting a sub-path into it (e.g. 'Blocks.Hrs') is what fans out. Call this first when you don't know a collection's field paths, then pass the ones you want to query_collection. " +
+        "Example values are OMITTED by default to stay lean — pass values:true to include a sample value per leaf. The jobs/ model is large (~260 paths); scope it with `only` (e.g. ['Sections','Totals']) to the subtrees you care about. " +
+        "Reflects the live data shape, not a static spec — fields absent from a sample record (empty arrays, null objects) won't appear.",
+      inputSchema: {
+        path: z
+          .string()
+          .describe("A collection (GET-multiple) path, e.g. 'jobs/', 'quotes/', 'customers/companies/', 'catalogs/'. {companyID} is auto-filled."),
+        only: z
+          .array(z.string())
+          .optional()
+          .describe("Restrict discovery to these TOP-LEVEL columns (e.g. ['Sections','Totals']). Omit to return every column — useful to trim the large jobs/ model to just the subtrees you'll query."),
+        values: z
+          .boolean()
+          .optional()
+          .describe("Include a sample value per leaf field. Default false (examples roughly double the response). Turn on when you need to see real data shapes."),
+        filters: z
+          .record(z.unknown())
+          .optional()
+          .describe("Optional column filters to pick WHICH record is sampled (e.g. { Stage: 'Progress' } to sample a record likely to have populated nested data). Property names are case-sensitive."),
+      },
+      annotations: { title: "Describe Collection Fields", readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ path, only, values, filters }) => {
+      try {
+        // A collection GET with display=all only returns the default list columns — the full nested
+        // tree (Sections, Totals, …) is NOT expanded there. So sample one ID from the collection, then
+        // GET that record BY ID, where display=all returns the complete shape.
+        const coll = normalizePath(path);
+        const { rows } = await client.getList(coll, { columns: ["ID"], pageSize: 1, ...(filters ?? {}) });
+        const sample = rows[0] as { ID?: number } | undefined;
+        if (!sample?.ID) {
+          return ok({ path, fields: [], note: "No records matched — cannot infer fields. Loosen filters or pick a collection with data." });
+        }
+        const record = await client.get(normalizePath(`${coll.replace(/\/$/, "")}/${sample.ID}`), { display: "all" });
+        return okLean({
+          path,
+          sampledId: sample.ID,
+          fields: describeRecord(record, { only, values }),
+          note: "Field paths from a live sample record. Paths flagged array:true fan out to one row per element in query_collection. Example values omitted (pass values:true to include them). Fields absent from this sample (empty arrays/null objects) won't appear.",
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   const writeBody = z
     .union([z.record(z.unknown()), z.array(z.record(z.unknown()))])
     .optional()
@@ -932,6 +1038,25 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+// The data path that backs query_collection, reused by the aggregation tools: select the requested
+// dot-paths via display=all (the only way to reliably pull a nested value like Total.BalanceDue —
+// top-level `columns` alone doesn't guarantee the nested field comes back), then narrow with
+// selectRecords. `allPages` walks the whole collection (for sums/aging); otherwise one page is returned.
+async function fetchProjected(
+  client: SimproClient,
+  path: string,
+  fields: string[],
+  opts: { filters?: Record<string, unknown>; allPages?: boolean; pageSize?: number } = {},
+): Promise<{ rows: Array<Record<string, unknown>>; pagination?: { page: number; pageSize?: number; totalPages: number; totalRows: number } }> {
+  const query = { columns: columnsForFields(fields), display: "all", ...(opts.filters ?? {}) };
+  if (opts.allPages) {
+    const raw = await client.getAllPages(path, query, { pageSize: opts.pageSize });
+    return { rows: selectRecords(raw, fields) };
+  }
+  const { rows, pagination } = await client.getList(path, { ...query, pageSize: opts.pageSize });
+  return { rows: selectRecords(rows, fields), pagination };
+}
+
 // Stock/Assets array names are unconfirmed (absent from probed data); a wrong guess undercounts, never miscounts.
 const ITEM_ARRAY_KEY: Record<ItemType, string> = {
   catalog: "Catalogs",
@@ -1018,16 +1143,20 @@ function daysBetween(a: string, b: string): number {
   return Math.round((ad - bd) / 86_400_000);
 }
 
+// Due date from a projected invoice row: prefer Simpro's PaymentTerms.DueDate, else derive it from
+// DateIssued + PaymentTerms.Days, else fall back to the issue date.
 function invoiceDueDate(inv: Record<string, any>): string | undefined {
-  const pt = inv.PaymentTerms;
-  if (pt?.DueDate) return String(pt.DueDate);
-  if (inv.DateIssued && pt?.Days != null) {
-    const issued = Date.parse(`${inv.DateIssued}T00:00:00Z`);
-    if (Number.isFinite(issued)) {
-      return new Date(issued + Number(pt.Days) * 86_400_000).toISOString().slice(0, 10);
+  const explicit = inv.PaymentTerms?.DueDate;
+  if (explicit) return String(explicit);
+  const issued = inv.DateIssued;
+  const days = inv.PaymentTerms?.Days;
+  if (issued && days != null) {
+    const ms = Date.parse(`${issued}T00:00:00Z`);
+    if (Number.isFinite(ms)) {
+      return new Date(ms + Number(days) * 86_400_000).toISOString().slice(0, 10);
     }
   }
-  return inv.DateIssued ? String(inv.DateIssued) : undefined;
+  return issued ? String(issued) : undefined;
 }
 
 function ageReceivables(rows: Array<Record<string, any>>, asOf: string | undefined, customerID: number) {
@@ -1038,7 +1167,7 @@ function ageReceivables(rows: Array<Record<string, any>>, asOf: string | undefin
   const detail: Array<Record<string, unknown>> = [];
 
   for (const inv of rows) {
-    const balance = Number(inv?.Total?.BalanceDue) || 0;
+    const balance = Number(inv.Total?.BalanceDue) || 0;
     if (balance === 0) continue;
     const due = invoiceDueDate(inv);
     const overdue = due ? daysBetween(today, due) : 0; // positive = past due
