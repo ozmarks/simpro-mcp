@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import express, { type Request, type Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
