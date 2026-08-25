@@ -1,0 +1,60 @@
+name: Publish to npm
+
+# Publishes @ozmarks/simpro-mcp-server on a version tag, so the server can be run
+# with `npx @ozmarks/simpro-mcp-server`.
+#
+# Requires an npm automation token (npmjs.com -> Access Tokens -> Granular/Automation,
+# read+write on @ozmarks) stored as the NPM_TOKEN repository secret. An automation
+# token bypasses 2FA, which interactive tokens cannot do in CI.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::Version mismatch — tag $tag, package.json $pkg."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Verify bin shebang
+        run: |
+          head -1 dist/index.js | grep -qx '#!/usr/bin/env node' \
+            || { echo "::error::dist/index.js is missing the node shebang; npx would fail on POSIX."; exit 1; }
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
