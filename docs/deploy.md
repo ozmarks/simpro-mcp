@@ -127,15 +127,18 @@ for broker state (seal key + DCR clients). Deploy it on any container platform (
 Provide the env vars for your chosen mode through the platform — **do not commit
 a populated `.env`.**
 
-### From a prebuilt image
+### Build locally vs. pull a published image
 
-To skip building and pull a published image instead, replace `build: .` with
-the image reference in `docker-compose.yml`:
+The bundled `docker-compose.yml` carries **both** `build: .` and
+`image: ghcr.io/ozmarks/simpro-mcp:latest`. As shipped it **builds the image
+locally and tags the result** with that name — it does not pull the published
+image. To pull the published image instead of building, **remove the `build: .`
+line** so only `image:` remains:
 
 ```yaml
 services:
   simpro-mcp:
-    image: ghcr.io/ozmarks/simpro-mcp:latest   # remove `build: .`
+    image: ghcr.io/ozmarks/simpro-mcp:latest   # build: . removed → pulls this published image
 ```
 
 ### Reaching the container
