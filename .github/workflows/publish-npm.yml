@@ -3,9 +3,9 @@ name: Publish to npm
 # Publishes @ozmarks-group/simpro-mcp-server on a version tag, so the server can be run
 # with `npx @ozmarks-group/simpro-mcp-server`.
 #
-# Requires an npm automation token (npmjs.com -> Access Tokens -> Granular/Automation,
-# read+write on @ozmarks-group) stored as the NPM_TOKEN repository secret. An automation
-# token bypasses 2FA, which interactive tokens cannot do in CI.
+# Authenticates via npm trusted publishing (OIDC), configured on the package at
+# npmjs.com -> Settings -> Trusted publisher. No registry token is stored in the repo.
+# Provenance is attested automatically, so `--provenance` is not passed.
 
 on:
   push:
@@ -15,7 +15,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # provenance attestation
+  id-token: write # OIDC trusted publishing + provenance
 
 jobs:
   publish:
@@ -39,6 +39,9 @@ jobs:
             exit 1
           fi
 
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@latest
+
       - name: Install dependencies
         run: npm ci
 
@@ -55,6 +58,4 @@ jobs:
 
       - name: Publish
         if: startsWith(github.ref, 'refs/tags/')
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
