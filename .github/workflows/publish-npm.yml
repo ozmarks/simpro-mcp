@@ -1,0 +1,61 @@
+name: Publish to npm
+
+# Publishes @ozmarks-group/simpro-mcp-server on a version tag, so the server can be run
+# with `npx @ozmarks-group/simpro-mcp-server`.
+#
+# Authenticates via npm trusted publishing (OIDC), configured on the package at
+# npmjs.com -> Settings -> Trusted publisher. No registry token is stored in the repo.
+# Provenance is attested automatically, so `--provenance` is not passed.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC trusted publishing + provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::Version mismatch — tag $tag, package.json $pkg."
+            exit 1
+          fi
+
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Verify bin shebang
+        run: |
+          head -1 dist/index.js | grep -qx '#!/usr/bin/env node' \
+            || { echo "::error::dist/index.js is missing the node shebang; npx would fail on POSIX."; exit 1; }
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        run: npm publish --access public
