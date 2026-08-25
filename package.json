@@ -1,5 +1,5 @@
 {
-  "name": "@ozmarks/simpro-mcp-server",
+  "name": "@ozmarks-group/simpro-mcp-server",
   "version": "0.2.0",
   "publishConfig": {
     "access": "public"
