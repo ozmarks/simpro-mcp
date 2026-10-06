@@ -4,7 +4,15 @@ import type { Config } from "./config.js";
 import { SimproClient, SimproError, topLevelRoute } from "./simproClient.js";
 import { cleanRichText, applyLean } from "./format.js";
 import { searchEndpoints, getEndpoint, closestRoutes } from "./catalog.js";
-import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
+import {
+  ITEM_TYPES,
+  ITEM_TYPE_KEYS,
+  itemCollectionPath,
+  planLineItemOps,
+  validateLineItemOps,
+  type ItemType,
+  type LineItemOp,
+} from "./lineItems.js";
 import { selectRecords, columnsForFields, describeRecord } from "./select.js";
 import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
 import { sharedUploadStore, validateStart, UploadError, CHUNK_MAX_BYTES, ALLOWED_EXTENSIONS } from "./uploads.js";
@@ -153,6 +161,9 @@ export function summarizeBulk(body: unknown): unknown {
   summary.results = body;
   return summary;
 }
+
+// Each update/delete is its own request, so this bounds a call to a few seconds at the shared ~8 req/s.
+const MAX_LINE_ITEM_OPS = 50;
 
 const entityArg = z
   .enum(["job", "quote"])
@@ -396,93 +407,96 @@ export function registerTools(
     },
   );
 
+  // Fresh schemas per branch: shared ones serialize as a $ref that some MCP clients don't resolve.
+  const lineItemType = () => z.enum(ITEM_TYPE_KEYS).describe(itemLocator.itemType.description ?? "");
+  const lineItemFields = () => z.record(z.unknown());
+  const lineItemOp = z.discriminatedUnion("op", [
+    z.object({
+      op: z.literal("add"),
+      itemType: lineItemType(),
+      fields: lineItemFields().describe("Body for the new line (required fields per type are in the tool description)."),
+    }),
+    z.object({
+      op: z.literal("update"),
+      itemType: lineItemType(),
+      itemID: z.number().int().positive().describe("The line's own ID (from list_line_items), not its catalog/anchor ID."),
+      fields: lineItemFields().describe("Fields to change (PATCH: omit what stays the same)."),
+    }),
+    z.object({
+      op: z.literal("delete"),
+      itemType: lineItemType(),
+      itemID: z.number().int().positive().describe("The line's own ID (from list_line_items)."),
+    }),
+  ]);
+
   server.registerTool(
-    "add_line_item",
+    "manage_line_items",
     {
-      title: "Add Line Item",
+      title: "Manage Line Items",
       description:
-        "Add a line item to a cost center. Routes to the correct collection for itemType. The result carries `resourceId` — the new line item's id — so a retry that lost the response can confirm-by-id rather than duplicating. Required fields per type — " +
+        "Add, update and delete line items in one cost center, one or many per call. Each op names its own itemType and the tool routes it to the right Simpro collection. " +
+        "Ops run in the order given; consecutive adds of the same type are sent as one bulk request. " +
+        "add — required fields per type: " +
         ITEM_TYPE_KEYS.map((k) => `${k}: ${ITEM_TYPES[k].createHint}`).join("; ") +
-        ". The catalog/labor/prebuild anchor fields take a numeric ID; find_materials resolves a catalog or prebuild ID from a name or part number.",
+        ". The catalog/labor/prebuild anchor fields take a numeric ID; find_materials resolves a catalog or prebuild ID from a name or part number. " +
+        "update — PATCH by the line's own itemID (from list_line_items); only the fields you pass change. Qty via fields.Total ({ Qty }); a oneOff's sell price via fields.SellPriceExDiscount (number), never SellPrice: { ExTax }. " +
+        "To change which catalog/labor/prebuild a line points at, delete it and add the new one. " +
+        "asset lines can't be updated and stock lines can't be deleted; such ops are rejected before anything is written. " +
+        "mergeQty: true makes adds increase the Qty of a matching existing line instead of adding a duplicate. " +
+        "Simpro has no transactions: on the first failed op the rest are skipped (unless continueOnError) and the result lists what was done, what failed and what was skipped. " +
+        "Single adds, updates and deletes carry `resourceId`; bulk adds return a per-item status tally.",
       inputSchema: {
-        ...itemLocator,
-        fields: z.record(z.unknown()).describe("Body fields for the new item (see required per type)."),
+        entity: itemLocator.entity,
+        id: itemLocator.id,
+        sectionID: itemLocator.sectionID,
+        costCenterID: itemLocator.costCenterID,
+        ops: z.array(lineItemOp).min(1).max(MAX_LINE_ITEM_OPS).describe(`Line item operations, run in order (max ${MAX_LINE_ITEM_OPS}).`),
+        mergeQty: z.boolean().optional().describe("Adds merge into a matching existing line's Qty (Simpro Post-Mode: merge). Default false."),
+        continueOnError: z.boolean().optional().describe("Keep running later ops after one fails. Default false (stop at the first failure)."),
       },
-      annotations: { title: "Add Line Item", readOnlyHint: false },
+      annotations: { title: "Manage Line Items", readOnlyHint: false, destructiveHint: true },
     },
-    async ({ entity, id, sectionID, costCenterID, itemType, fields }) => {
-      try {
-        const path = itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType);
-        return await okWrite("POST", path, { body: fields });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
+    async ({ entity, id, sectionID, costCenterID, ops, mergeQty, continueOnError }) => {
+      const invalid = validateLineItemOps(ops as LineItemOp[]);
+      if (invalid.length) return fail(new Error(`Nothing was written.\n${invalid.join("\n")}`));
 
-  const updatableTypes = ITEM_TYPE_KEYS.filter((k) => ITEM_TYPES[k].canUpdate);
-  server.registerTool(
-    "update_line_item",
-    {
-      title: "Update Line Item",
-      description:
-        "Update one existing line item in place (PATCH — only the fields you pass change). Routes to the correct collection for itemType; `itemID` is the line item's own id (from list_line_items), not its catalog/anchor id. " +
-        `Updatable types: ${updatableTypes.join(", ")}. ` +
-        "assets have no update endpoint — delete and re-add instead. " +
-        "Common edits: Qty via fields.Total ({ Qty }); a oneOff's sell price via fields.SellPriceExDiscount (number) — never POST SellPrice: { ExTax } (read-only shape). To change a line's catalog/labor/prebuild item, delete it and add the new one rather than swapping the anchor.",
-      inputSchema: {
-        ...itemLocator,
-        itemID: z.number().int().positive().describe("The line item's own ID (from list_line_items), i.e. the id under the cost center's item collection."),
-        fields: z.record(z.unknown()).describe("Fields to change (PATCH semantics — omit what stays the same)."),
-      },
-      annotations: { title: "Update Line Item", readOnlyHint: false },
-    },
-    async ({ entity, id, sectionID, costCenterID, itemType, itemID, fields }) => {
-      try {
-        if (!ITEM_TYPES[itemType as ItemType].canUpdate) {
-          return fail(
-            new Error(
-              `Item type '${itemType}' has no Simpro update endpoint. Delete the line and re-add it (use simpro_api_delete then add_line_item).`,
-            ),
-          );
+      const steps = planLineItemOps(ops as LineItemOp[]);
+      const results: Record<string, unknown>[] = [];
+      let failed = 0;
+      let skipped = 0;
+      for (const step of steps) {
+        const summary: Record<string, unknown> = { ops: step.indexes, op: step.op, itemType: step.itemType };
+        if ("itemID" in step) summary.itemID = step.itemID;
+        if (failed && !continueOnError) {
+          skipped += step.indexes.length;
+          results.push({ ...summary, status: "skipped" });
+          continue;
         }
-        const path = `${itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType)}${itemID}`;
-        return await okWrite("PATCH", path, { body: fields });
-      } catch (e) {
-        return fail(e);
+        const collection = itemCollectionPath(entity, id, sectionID, costCenterID, step.itemType);
+        try {
+          if (step.op === "add" && (step.bodies.length > 1 || mergeQty)) {
+            const bulk = summarizeBulk(
+              await client.post(`${collection}multiple/`, step.bodies, { mergeMode: mergeQty }),
+            ) as { bulk?: { failed: number } };
+            const bad = bulk.bulk?.failed ?? 0;
+            if (bad) failed += bad;
+            results.push({ ...summary, status: bad ? "failed" : "ok", result: bulk });
+            continue;
+          }
+          const [method, path, body] =
+            step.op === "add"
+              ? (["POST", collection, step.bodies[0]] as const)
+              : step.op === "update"
+                ? (["PATCH", `${collection}${step.itemID}`, step.fields] as const)
+                : (["DELETE", `${collection}${step.itemID}`, undefined] as const);
+          const { resourceId } = await client.requestWithReceipt(method, path, { body });
+          results.push({ ...summary, status: "ok", ...(resourceId !== undefined ? { resourceId } : {}) });
+        } catch (e) {
+          failed += step.indexes.length;
+          results.push({ ...summary, status: "failed", error: fail(e).content[0].text });
+        }
       }
-    },
-  );
-
-  server.registerTool(
-    "bulk_upsert_items",
-    {
-      title: "Bulk Upsert Line Items",
-      description:
-        "Add, merge, or replace many line items of one type in a cost center in a single call. " +
-        "mode='append' creates new items; mode='merge' increases the Qty of matching existing items " +
-        "(Post-Mode: merge); mode='replace' deletes all existing items of that type and inserts these (PUT). " +
-        "append/merge use Simpro's bulk route and return a per-item status array (Batch-ID / Resource-ID / Location, " +
-        "not the full item bodies); the created items are then readable via list_line_items. " +
-        "Required fields per item type — " +
-        ITEM_TYPE_KEYS.map((k) => `${k}: ${ITEM_TYPES[k].createHint}`).join("; ") + ".",
-      inputSchema: {
-        ...itemLocator,
-        mode: z
-          .enum(["append", "merge", "replace"])
-          .describe("append = add new (POST); merge = increment matching Qty (POST + Post-Mode: merge); replace = overwrite all (PUT)."),
-        items: z.array(z.record(z.unknown())).min(1).describe("Array of item bodies (see required fields per type)."),
-      },
-      annotations: { title: "Bulk Upsert Line Items", readOnlyHint: false, destructiveHint: true },
-    },
-    async ({ entity, id, sectionID, costCenterID, itemType, mode, items }) => {
-      try {
-        const path = itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType);
-        if (mode === "replace") return ok(await client.put(path, items));
-        return ok(summarizeBulk(await client.post(`${path}multiple/`, items, { mergeMode: mode === "merge" })));
-      } catch (e) {
-        return fail(e);
-      }
+      return ok({ total: ops.length, failed, skipped, results });
     },
   );
 
@@ -912,7 +926,7 @@ export function registerTools(
     {
       title: "Find Simpro Operation",
       description:
-        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote or line item. Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods. " +
+        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote (for line items use manage_line_items). Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods. " +
         "Pre-builds come in two kinds with separate routes, set price (prebuilds/setPrice/{id}) and standard price (prebuilds/standardPrice/{id}); each ID answers on only one. The generic prebuilds/ list shows which via its `_href` column (request columns 'ID,Name,_href').",
       inputSchema: {
         query: z.string().describe("What you want to do, in keywords, e.g. 'list customer contacts' or 'update a quote'."),
