@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
-import { SimproClient, SimproError } from "./simproClient.js";
+import { SimproClient, SimproError, topLevelRoute } from "./simproClient.js";
 import { cleanRichText, applyLean } from "./format.js";
 import { searchEndpoints, getEndpoint } from "./catalog.js";
 import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
@@ -1125,6 +1125,12 @@ export function normalizePath(path: string): string {
   const qIdx = rel.indexOf("?");
   const query = qIdx >= 0 ? rel.slice(qIdx) : "";
   let route = qIdx >= 0 ? rel.slice(0, qIdx) : rel;
+
+  // Top-level routes (currentUser, info, the companies listing) sit outside the
+  // company scope; canonicalize bare and full spellings to the api/v1.0/ form the
+  // client routes past its company pin. No company-scoped route shares these segments.
+  const bare = route.replace(/^api\/v1\.0\//, "");
+  if (topLevelRoute(bare)) route = `api/v1.0/${bare}`;
 
   const trimmed = route.replace(/\/+$/, "");
   const lastSegment = trimmed.split("/").pop() ?? "";
