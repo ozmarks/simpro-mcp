@@ -242,7 +242,7 @@ export function registerTools(
   const okWrite = async (
     method: "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
-    opts: { body?: unknown; query?: Record<string, unknown>; mergeMode?: boolean } = {},
+    opts: { body?: unknown; query?: Record<string, unknown> } = {},
   ) => {
     const { body, resourceId } = await client.requestWithReceipt(method, path, opts);
     return ok(writeReceipt(summarizeBulk(body), resourceId));
@@ -442,7 +442,7 @@ export function registerTools(
         "update — PATCH by the line's own itemID (from list_line_items); only the fields you pass change. Qty via fields.Total ({ Qty }); a oneOff's sell price via fields.SellPriceExDiscount (number), never SellPrice: { ExTax }. " +
         "To change which catalog/labor/prebuild a line points at, delete it and add the new one. " +
         "asset lines can't be updated and stock lines can't be deleted; such ops are rejected before anything is written. " +
-        "mergeQty: true makes adds increase the Qty of a matching existing line instead of adding a duplicate. " +
+        "To raise the qty of a line that already exists, update its Total.Qty rather than adding the item again (an add always creates a new line). " +
         "Simpro has no transactions: on the first failed op the rest are skipped (unless continueOnError) and the result lists what was done, what failed and what was skipped. " +
         "Single adds, updates and deletes carry `resourceId`; bulk adds return a per-item status tally.",
       inputSchema: {
@@ -451,12 +451,11 @@ export function registerTools(
         sectionID: itemLocator.sectionID,
         costCenterID: itemLocator.costCenterID,
         ops: z.array(lineItemOp).min(1).max(MAX_LINE_ITEM_OPS).describe(`Line item operations, run in order (max ${MAX_LINE_ITEM_OPS}).`),
-        mergeQty: z.boolean().optional().describe("Adds merge into a matching existing line's Qty (Simpro Post-Mode: merge). Default false."),
         continueOnError: z.boolean().optional().describe("Keep running later ops after one fails. Default false (stop at the first failure)."),
       },
       annotations: { title: "Manage Line Items", readOnlyHint: false, destructiveHint: true },
     },
-    async ({ entity, id, sectionID, costCenterID, ops, mergeQty, continueOnError }) => {
+    async ({ entity, id, sectionID, costCenterID, ops, continueOnError }) => {
       const invalid = validateLineItemOps(ops as LineItemOp[]);
       if (invalid.length) return fail(new Error(`Nothing was written.\n${invalid.join("\n")}`));
 
@@ -474,9 +473,9 @@ export function registerTools(
         }
         const collection = itemCollectionPath(entity, id, sectionID, costCenterID, step.itemType);
         try {
-          if (step.op === "add" && (step.bodies.length > 1 || mergeQty)) {
+          if (step.op === "add" && step.bodies.length > 1) {
             const bulk = summarizeBulk(
-              await client.post(`${collection}multiple/`, step.bodies, { mergeMode: mergeQty }),
+              await client.post(`${collection}multiple/`, step.bodies),
             ) as { bulk?: { failed: number } };
             const bad = bulk.bulk?.failed ?? 0;
             if (bad) failed += bad;

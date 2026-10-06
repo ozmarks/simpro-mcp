@@ -77,7 +77,6 @@ export interface RequestOpts {
   query?: Record<string, unknown>;
   body?: unknown;
   bearer?: string;
-  mergeMode?: boolean;
   timeoutMs?: number;
 }
 
@@ -153,7 +152,6 @@ export class SimproClient {
       "Content-Type": "application/json",
       Accept: "application/json",
     };
-    if (opts.mergeMode) headers["Post-Mode"] = "merge";
     const url = this.url(path, opts.query);
 
     let attempt = 0;
@@ -231,8 +229,8 @@ export class SimproClient {
   get(path: string, query?: Record<string, unknown>, bearer?: string) {
     return this.request("GET", path, { query, bearer });
   }
-  post(path: string, body: unknown, opts: { mergeMode?: boolean; bearer?: string } = {}) {
-    return this.request("POST", path, { body, mergeMode: opts.mergeMode, bearer: opts.bearer });
+  post(path: string, body: unknown, bearer?: string) {
+    return this.request("POST", path, { body, bearer });
   }
   put(path: string, body: unknown, bearer?: string) {
     return this.request("PUT", path, { body, bearer });

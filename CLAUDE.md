@@ -116,8 +116,10 @@ These are non-obvious and were verified live; the code comments hold the full de
   `404 Invalid route`. `normalizePath()` keys off whether the last segment is numeric.
 - **Bulk routes use `/multiple/`.** POSTing an *array* to a bare collection makes Simpro
   read index 0 as a column name (`422 /0: Invalid column`). For many items, append
-  `/multiple/` (see `manage_line_items`). `Post-Mode: merge` header increments matching
-  Qty; it's documented but not in Swagger.
+  `/multiple/` (see `manage_line_items`).
+- **`Post-Mode: merge` doesn't work.** Simpro documents it (increment a matching line's Qty), but
+  live it 422s with a bogus "currently opened by another user" lock error on both `/multiple/` and
+  the bare collection, even while holding the lock. To bump a qty, PATCH the line's `Total.Qty`.
 - **Writes often return 204 No Content** → `data` is `undefined`. `ok()` serializes that
   to `{success:true}` so a successful write doesn't look like a JSON error.
 - **Rate limit is 10 req/s per integration**, shared across all users on the Cowork
