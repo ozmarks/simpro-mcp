@@ -17,11 +17,8 @@ something, the agent can still get to it.
 > ⚠️ **This tool can write and delete, not just read.** It reaches the full Simpro API,
 > including the endpoints that update and delete records. An AI agent driving it can - by
 > mistake or by following a bad instruction - modify or destroy quotes, jobs, customers,
-> catalogue items, and more in your live Simpro account, in bulk, with no undo. It acts with
-> whatever permissions the key or login you give it has. **Don't hand it to an agent you
-> don't trust, don't let it run unattended against production, and give it a Simpro
-> login/key scoped to only what it actually needs.** If you want read-only safety, create a
-> Simpro user with read-only permissions and authenticate as that user.
+> catalogue items, and more in your live Simpro account, in bulk, with no undo. **Don't hand
+> it to an agent you don't trust, and don't let it run unattended against production.**
 >
 > This was developed from an internal tool we use that sits behind our own MCP Gateway. We added some additional features to make it a bit more functional for the community, but the mcbp and OAuth Broker mode are not used by us internally.
 >
@@ -115,7 +112,7 @@ The **Authentication mode** field on the install screen offers three choices:
 
 | Mode | What it is | When to use |
 |------|------------|-------------|
-| `authorization_code` | Browser login as **you**. Acts with your Simpro permissions. | **Default - recommended.** |
+| `authorization_code` | Browser login as **you**. | **Default - recommended.** |
 | `client_credentials` | Machine login with no user. Acts with the OAuth app's full access. | Unattended/automation where there's no person to log in. Also needs Client ID + secret; no browser step. |
 | `api_key` | A legacy standalone API key. | Only if you can't create an OAuth app. Paste the key into the **Simpro API Key** field. Static keys are deprecated by Simpro. |
 
