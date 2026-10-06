@@ -7,6 +7,7 @@ import { searchEndpoints, getEndpoint } from "./catalog.js";
 import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
 import { selectRecords, columnsForFields, describeRecord } from "./select.js";
 import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
+import { sharedUploadStore, validateStart, UploadError, CHUNK_MAX_BYTES, ALLOWED_EXTENSIONS } from "./uploads.js";
 
 // One-line agent-facing update notice (stdio surfaces it on a tool result; HTTP logs it instead).
 export function formatUpdateNotice(u: UpdateInfo): string {
@@ -136,6 +137,7 @@ export function registerTools(
   versionChecker?: VersionChecker,
 ): void {
   const defaultPageSize = cfg.defaultPageSize;
+  const uploads = sharedUploadStore({ maxUploadBytes: cfg.maxUploadBytes, memoryBytes: cfg.uploadMemoryBytes });
 
   // Surface a "new version available" notice as an extra content block on the FIRST tool result
   // of this server's lifetime, then latch off. stdio = one long-lived server, so this fires once
@@ -455,6 +457,105 @@ export function registerTools(
         const src = (await client.get(`${b}/${id}`, { display: "all" })) as Record<string, any>;
         const body = buildDuplicateBody(entity, src, { intoCustomer, name });
         return await okWrite("POST", `${b}/`, { body });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "start_attachment_upload",
+    {
+      title: "Start Attachment Upload",
+      description:
+        "Begin attaching a file (up to 50 MB) to a quote or job in pieces, for files too large for one call. " +
+        "Order: start_attachment_upload once → upload_attachment_chunk per piece (any order, resends overwrite) → finish_attachment_upload → poll attachment_upload_status until done/failed. " +
+        `Split the raw file into ${CHUNK_MAX_BYTES} bytes per chunk or fewer (before base64); a small file is just one chunk. ` +
+        `Allowed types: ${ALLOWED_EXTENSIONS.join(" ")}. The file is posted byte-for-byte under its original name.`,
+      inputSchema: {
+        entity: entityArg,
+        id: z.number().int().positive().describe("Quote or job ID to attach to."),
+        filename: z.string().min(1).describe("Original filename including extension; spaces and brackets are kept."),
+        size: z.number().int().positive().describe("Total file size in bytes."),
+        sha256: z.string().describe("Hex SHA-256 of the whole file, checked after joining."),
+        chunks: z.number().int().positive().describe(`Number of chunks the file will be sent in (each at most ${CHUNK_MAX_BYTES} bytes decoded).`),
+      },
+      annotations: { title: "Start Attachment Upload", readOnlyHint: false },
+    },
+    async ({ entity, id, filename, size, sha256, chunks }) => {
+      try {
+        validateStart({ filename, size, sha256, chunks }, cfg.maxUploadBytes);
+        try {
+          await client.get(`${base(entity)}/${id}`, { columns: "ID" });
+        } catch (e) {
+          if (e instanceof SimproError && e.status === 404) throw new UploadError(`${entity} ${id} does not exist in Simpro.`);
+          throw e;
+        }
+        return ok(uploads.start({ entity, id, filename, size, sha256, chunks }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "upload_attachment_chunk",
+    {
+      title: "Upload Attachment Chunk",
+      description:
+        "Send one piece of a file started with start_attachment_upload. Indexes are 0-based, may arrive in any order or in parallel, and resending an index overwrites it. " +
+        "Returns how many of the chunks have arrived.",
+      inputSchema: {
+        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+        index: z.number().int().min(0).describe("0-based chunk index."),
+        data: z.string().min(1).describe(`Base64 of this chunk's raw bytes (at most ${CHUNK_MAX_BYTES} bytes decoded).`),
+      },
+      annotations: { title: "Upload Attachment Chunk", readOnlyHint: false, idempotentHint: true },
+    },
+    async ({ uploadId, index, data }) => {
+      try {
+        return ok(uploads.putChunk(uploadId, index, data));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "finish_attachment_upload",
+    {
+      title: "Finish Attachment Upload",
+      description:
+        "Join and verify (size, SHA-256) all chunks of an upload, then attach the file to the quote/job in the background. " +
+        "Returns status 'working' (poll attachment_upload_status), or 'failed' with nothing posted if verification fails. Refused while chunks are missing (names them). Safe to call again — never attaches twice.",
+      inputSchema: {
+        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+      },
+      annotations: { title: "Finish Attachment Upload", readOnlyHint: false },
+    },
+    async ({ uploadId }) => {
+      try {
+        return ok(uploads.finish(uploadId, client));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "attachment_upload_status",
+    {
+      title: "Attachment Upload Status",
+      description:
+        "Status of a chunked attachment upload: collecting (with chunks received), working, done (with Simpro's string attachmentId), or failed (with the reason).",
+      inputSchema: {
+        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+      },
+      annotations: { title: "Attachment Upload Status", readOnlyHint: true },
+    },
+    async ({ uploadId }) => {
+      try {
+        return ok(uploads.status(uploadId));
       } catch (e) {
         return fail(e);
       }
@@ -1016,7 +1117,7 @@ export function registerTools(
   );
 }
 
-function normalizePath(path: string): string {
+export function normalizePath(path: string): string {
   const p = path.trim();
   const m = p.match(/\/api\/v1\.0\/companies\/[^/]+\/(.*)$/);
   let rel = (m ? m[1] : p).replace(/^\/+/, "");
@@ -1025,8 +1126,10 @@ function normalizePath(path: string): string {
   const query = qIdx >= 0 ? rel.slice(qIdx) : "";
   let route = qIdx >= 0 ? rel.slice(0, qIdx) : rel;
 
-  const lastSegment = route.replace(/\/+$/, "").split("/").pop() ?? "";
-  if (/^\d+$/.test(lastSegment)) {
+  const trimmed = route.replace(/\/+$/, "");
+  const lastSegment = trimmed.split("/").pop() ?? "";
+  // Attachment file IDs are opaque strings, not numbers, but are still item routes.
+  if (/^\d+$/.test(lastSegment) || /(^|\/)attachments\/files\/[^/]+$/.test(trimmed)) {
     route = route.replace(/\/+$/, "");
   } else if (route && !route.endsWith("/")) {
     route = `${route}/`;

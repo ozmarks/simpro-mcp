@@ -41,6 +41,8 @@ export interface Config {
   tokenCacheFile: string;
   defaultPageSize: number;
   maxResultBytes: number;
+  maxUploadBytes: number;
+  uploadMemoryBytes: number;
   version: string;
   versionCheckUrl: string;
   versionCheckEnabled: boolean;
@@ -218,6 +220,8 @@ export function loadConfig(): Config {
     tokenCacheFile: resolveTokenCacheFile(),
     defaultPageSize: intEnv("SIMPRO_DEFAULT_PAGE_SIZE", 50),
     maxResultBytes: intEnv("SIMPRO_MAX_RESULT_BYTES", 100_000),
+    maxUploadBytes: intEnv("SIMPRO_MAX_UPLOAD_BYTES", 50 * 1024 * 1024),
+    uploadMemoryBytes: intEnv("SIMPRO_UPLOAD_MEMORY_BYTES", 200 * 1024 * 1024),
     version: readPackageVersion(),
     versionCheckUrl: process.env.SIMPRO_VERSION_CHECK_URL || DEFAULT_VERSION_CHECK_URL,
     versionCheckEnabled: (process.env.SIMPRO_VERSION_CHECK ?? "").trim().toLowerCase() !== "off",

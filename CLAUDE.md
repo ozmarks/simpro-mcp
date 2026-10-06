@@ -96,6 +96,7 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/login.ts` | `npm run login` entry — runs the `authorization_code` browser flow and caches the token without starting the server. |
 | `src/tools.ts` | All MCP tool registrations + helpers (~990 lines; the bulk of the logic). |
 | `src/lineItems.ts` | The 7 cost-center item types: URL segment, required anchor field, supported verbs. |
+| `src/uploads.ts` | Chunked attachment upload: in-process `UploadStore` singleton (TTL sessions, memory cap), join + SHA-256 verify, background post with dedupe + retry. |
 | `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
 | `src/format.ts` | Output shaping: HTML rich-text → compact text/markdown, recursive cleaning. |
 | `data/simpro-api-index.json` | Prebuilt index of ~1,300 endpoints (method/path/summary/tags/params). Ships with the build. |
@@ -130,6 +131,11 @@ These are non-obvious and were verified live; the code comments hold the full de
   10/s ceiling makes scaling out pointless. Simpro sends no `Retry-After`/rate-limit
   headers, so 429 uses our own exponential backoff with jitter (capped under
   Cowork's 30s/call budget).
+- **Attachments are whole-file only.** `POST {quotes|jobs}/{id}/attachments/files/` takes
+  `{Filename, Base64Data}` in one request; there is no append, so `*_attachment_upload*` tools
+  join chunks in-process first. Attachment `ID`s are **strings**, not numbers. Upload sessions
+  live in a process-wide singleton (same single-instance assumption as the limiter), and the
+  background post uses the bearer from the `finish` request, which HTTP modes can't refresh.
 - **`oneOff` sell price**: write `SellPriceExDiscount` (number) or
   `EstimatedCost`+`Markup`; never POST `SellPrice: { ExTax }` (that's the read shape →
   422). See `ITEM_TYPES.oneOff.createHint`.

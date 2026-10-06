@@ -65,6 +65,14 @@ export function extractResourceId(headers: Headers): string | number | undefined
   return undefined;
 }
 
+export interface RequestOpts {
+  query?: Record<string, unknown>;
+  body?: unknown;
+  bearer?: string;
+  mergeMode?: boolean;
+  timeoutMs?: number;
+}
+
 export class SimproClient {
   private readonly limiter = sharedLimiter;
   private static readonly MAX_429_RETRIES = 4;
@@ -117,12 +125,7 @@ export class SimproClient {
   private async requestRaw(
     method: string,
     path: string,
-    opts: {
-      query?: Record<string, unknown>;
-      body?: unknown;
-      bearer?: string;
-      mergeMode?: boolean;
-    } = {},
+    opts: RequestOpts = {},
   ): Promise<{ body: unknown; headers: Headers }> {
     // Resolve the token before the limiter so an OAuth fetch doesn't hold a bucket token.
     const headers: Record<string, string> = {
@@ -142,6 +145,7 @@ export class SimproClient {
         method,
         headers,
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
       });
 
       // 401 with an OAuth provider: invalidate, re-fetch once, retry.
@@ -187,12 +191,7 @@ export class SimproClient {
   async request(
     method: string,
     path: string,
-    opts: {
-      query?: Record<string, unknown>;
-      body?: unknown;
-      bearer?: string;
-      mergeMode?: boolean;
-    } = {},
+    opts: RequestOpts = {},
   ): Promise<unknown> {
     const { body } = await this.requestRaw(method, path, opts);
     return body;
@@ -203,12 +202,7 @@ export class SimproClient {
   async requestWithReceipt(
     method: string,
     path: string,
-    opts: {
-      query?: Record<string, unknown>;
-      body?: unknown;
-      bearer?: string;
-      mergeMode?: boolean;
-    } = {},
+    opts: RequestOpts = {},
   ): Promise<{ body: unknown; resourceId?: string | number }> {
     const { body, headers } = await this.requestRaw(method, path, opts);
     return { body, resourceId: extractResourceId(headers) };
