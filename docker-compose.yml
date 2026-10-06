@@ -53,6 +53,8 @@ services:
       SIMPRO_DEFAULT_PAGE_SIZE: ${SIMPRO_DEFAULT_PAGE_SIZE:-50}
       # Hard ceiling (bytes) on a single serialized tool result.
       SIMPRO_MAX_RESULT_BYTES: ${SIMPRO_MAX_RESULT_BYTES:-100000}
+      SIMPRO_MAX_UPLOAD_BYTES: ${SIMPRO_MAX_UPLOAD_BYTES:-52428800}
+      SIMPRO_UPLOAD_MEMORY_BYTES: ${SIMPRO_UPLOAD_MEMORY_BYTES:-209715200}
       # No SIMPRO_API_KEY on the HTTP path: it refuses to start with it set.
 
     volumes:

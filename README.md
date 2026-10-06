@@ -202,6 +202,8 @@ Do **not** set `SIMPRO_API_KEY` in this mode - the server will refuse to start.
 |---------|---------|--------------|
 | `SIMPRO_DEFAULT_PAGE_SIZE` | `50` | Rows per page for list results when not specified. Max 250. |
 | `SIMPRO_MAX_RESULT_BYTES` | `100000` | Largest single answer allowed before it's held back and the agent is asked to narrow the request. |
+| `SIMPRO_MAX_UPLOAD_BYTES` | `52428800` | Largest file accepted by the chunked attachment upload tools (50 MB). |
+| `SIMPRO_UPLOAD_MEMORY_BYTES` | `209715200` | Total bytes all in-progress uploads may hold in memory at once (200 MB). |
 
 ---
 
@@ -255,6 +257,8 @@ You can also tune how much data comes back at once:
 |---------|---------|--------------|
 | `SIMPRO_DEFAULT_PAGE_SIZE` | `50` | Rows per page for list results when not specified. Max 250. |
 | `SIMPRO_MAX_RESULT_BYTES` | `100000` | Largest single answer allowed before it's held back and the agent is asked to narrow the request. |
+| `SIMPRO_MAX_UPLOAD_BYTES` | `52428800` | Largest file accepted by the chunked attachment upload tools (50 MB). |
+| `SIMPRO_UPLOAD_MEMORY_BYTES` | `209715200` | Total bytes all in-progress uploads may hold in memory at once (200 MB). |
 
 ---
 

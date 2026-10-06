@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { itemCollectionPath, ITEM_TYPES, ITEM_TYPE_KEYS } from "../src/lineItems.js";
+import {
+  itemCollectionPath,
+  planLineItemOps,
+  validateLineItemOps,
+  ITEM_TYPES,
+  ITEM_TYPE_KEYS,
+  type LineItemOp,
+} from "../src/lineItems.js";
 
 test("itemCollectionPath builds a job collection path with a trailing slash", () => {
   assert.equal(
@@ -26,16 +33,14 @@ test("itemCollectionPath ends with the type's segment for every type", () => {
   }
 });
 
-test("stock cannot delete or replace but can update", () => {
+test("stock cannot delete but can update", () => {
   assert.equal(ITEM_TYPES.stock.canDelete, false);
-  assert.equal(ITEM_TYPES.stock.canReplace, false);
   assert.equal(ITEM_TYPES.stock.canUpdate, true);
 });
 
-test("asset cannot update but can delete and replace", () => {
+test("asset cannot update but can delete", () => {
   assert.equal(ITEM_TYPES.asset.canUpdate, false);
   assert.equal(ITEM_TYPES.asset.canDelete, true);
-  assert.equal(ITEM_TYPES.asset.canReplace, true);
 });
 
 test("anchorField matches the documented anchor per type", () => {
@@ -56,4 +61,51 @@ test("anchorField matches the documented anchor per type", () => {
 test("ITEM_TYPE_KEYS equals Object.keys(ITEM_TYPES) and has 7 entries", () => {
   assert.deepEqual([...ITEM_TYPE_KEYS], Object.keys(ITEM_TYPES));
   assert.equal(ITEM_TYPE_KEYS.length, 7);
+});
+
+test("planLineItemOps batches consecutive adds of the same type", () => {
+  const ops: LineItemOp[] = [
+    { op: "add", itemType: "catalog", fields: { Catalog: 1 } },
+    { op: "add", itemType: "catalog", fields: { Catalog: 2 } },
+    { op: "add", itemType: "labor", fields: { LaborType: 3 } },
+  ];
+  assert.deepEqual(planLineItemOps(ops), [
+    { op: "add", itemType: "catalog", indexes: [0, 1], bodies: [{ Catalog: 1 }, { Catalog: 2 }] },
+    { op: "add", itemType: "labor", indexes: [2], bodies: [{ LaborType: 3 }] },
+  ]);
+});
+
+test("planLineItemOps keeps order: an update between adds splits the batch", () => {
+  const ops: LineItemOp[] = [
+    { op: "add", itemType: "catalog", fields: { Catalog: 1 } },
+    { op: "update", itemType: "catalog", itemID: 9, fields: { Total: { Qty: 2 } } },
+    { op: "add", itemType: "catalog", fields: { Catalog: 2 } },
+    { op: "delete", itemType: "oneOff", itemID: 7 },
+  ];
+  assert.deepEqual(
+    planLineItemOps(ops).map((s) => [s.op, s.indexes]),
+    [["add", [0]], ["update", [1]], ["add", [2]], ["delete", [3]]],
+  );
+});
+
+test("validateLineItemOps rejects asset updates and stock deletes by index", () => {
+  const errors = validateLineItemOps([
+    { op: "update", itemType: "asset", itemID: 1, fields: {} },
+    { op: "delete", itemType: "catalog", itemID: 2 },
+    { op: "delete", itemType: "stock", itemID: 3 },
+  ]);
+  assert.equal(errors.length, 2);
+  assert.match(errors[0], /^ops\[0\]: asset/);
+  assert.match(errors[1], /^ops\[2\]: stock/);
+});
+
+test("validateLineItemOps accepts every supported op", () => {
+  assert.deepEqual(
+    validateLineItemOps([
+      { op: "add", itemType: "asset", fields: { Asset: 1 } },
+      { op: "update", itemType: "stock", itemID: 1, fields: {} },
+      { op: "delete", itemType: "asset", itemID: 1 },
+    ]),
+    [],
+  );
 });

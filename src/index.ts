@@ -98,7 +98,8 @@ function bearerFrom(req: IncomingMessage): string | undefined {
 
 class BodyTooLargeError extends Error {}
 
-const MAX_REQUEST_BYTES = 1024 * 1024;
+// Fits an upload_attachment_chunk call: 600 KB decoded is ~800 KB of base64 plus the envelope.
+const MAX_REQUEST_BYTES = 1536 * 1024;
 
 async function readBody(req: IncomingMessage, maxBytes = MAX_REQUEST_BYTES): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -266,7 +267,7 @@ async function runBrokerHttp(cfg: Config, broker: BrokerConfig): Promise<void> {
   app.get("/healthz", (_req, res) => { res.type("text").send("ok"); });
   app.use(brokerRouter(broker));
 
-  app.use(express.json());
+  app.use(express.json({ limit: MAX_REQUEST_BYTES }));
 
   const verifier = {
     async verifyAccessToken(token: string): Promise<AuthInfo> {

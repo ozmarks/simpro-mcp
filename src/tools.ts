@@ -1,12 +1,21 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
-import { SimproClient, SimproError } from "./simproClient.js";
+import { SimproClient, SimproError, topLevelRoute } from "./simproClient.js";
 import { cleanRichText, applyLean } from "./format.js";
-import { searchEndpoints, getEndpoint } from "./catalog.js";
-import { ITEM_TYPES, ITEM_TYPE_KEYS, itemCollectionPath, type ItemType } from "./lineItems.js";
+import { searchEndpoints, getEndpoint, closestRoutes } from "./catalog.js";
+import {
+  ITEM_TYPES,
+  ITEM_TYPE_KEYS,
+  itemCollectionPath,
+  planLineItemOps,
+  validateLineItemOps,
+  type ItemType,
+  type LineItemOp,
+} from "./lineItems.js";
 import { selectRecords, columnsForFields, describeRecord } from "./select.js";
 import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
+import { sharedUploadStore, validateStart, UploadError, CHUNK_MAX_BYTES, ALLOWED_EXTENSIONS } from "./uploads.js";
 
 // One-line agent-facing update notice (stdio surfaces it on a tool result; HTTP logs it instead).
 export function formatUpdateNotice(u: UpdateInfo): string {
@@ -52,34 +61,109 @@ export type SimproFieldError = { path?: string; message?: string; value?: unknow
 // concrete fix hint so the agent self-corrects (per the "clearer errors, no silent translation" rule).
 export function footgunHint(e: SimproFieldError): string | undefined {
   const path = (e.path ?? "").toLowerCase();
+  const message = e.message ?? "";
   // Live: POSTing SellPrice.ExTax → path "/SellPrice/ExTax", message "This API Column does not allow POST requests."
   if (path.includes("sellprice")) {
     return "SellPrice is a read-only shape ({ ExTax, IncTax }) and can't be written. To set a one-off's price, send SellPriceExDiscount (a number) for an exact sell, or EstimatedCost + Markup.";
   }
+  // Live: "This quote is currently locked by Jane Citizen. Please try again later."
+  const lock = message.match(/currently locked by ([^.]+)/i);
+  if (lock) {
+    return (
+      `The record is open in Simpro by ${lock[1].trim()}, and Simpro locks it until they close it. ` +
+      "The API can't read who holds a lock or when it clears, so retrying won't help. Tell the user the item is locked " +
+      "and must be closed inside Simpro, then retry. Don't DELETE the …/lock/ route to force the write."
+    );
+  }
+  if (/(standard|set)-price prebuild not found/i.test(message)) {
+    return (
+      "Pre-builds are either set price (/prebuilds/setPrice/{id}) or standard price (/prebuilds/standardPrice/{id}), and each ID " +
+      "answers on only one route. GET prebuilds/ with columns 'ID,_href' shows which route each pre-build uses."
+    );
+  }
+  if (/Material Sell mode is 'Default'/i.test(message) || /add a default labour rate/i.test(message)) {
+    return (
+      "A standard-price pre-build's price comes from its materials and labour, so TotalEx can't be set directly. Send " +
+      "{ MaterialSale: 'None', MaterialSellPrice: <price> }. The price only sticks once the pre-build has materials " +
+      "(POST prebuilds/{id}/catalogs/); without them an update can report success while the price stays 0."
+    );
+  }
   return undefined;
 }
 
-function fail(err: unknown) {
+function formatFieldErrors(errors: SimproFieldError[]): string {
+  return errors
+    .map((e) => {
+      const hint = footgunHint(e);
+      return (
+        `  - ${e.path ?? "(root)"}: ${e.message}${e.value !== undefined && e.value !== null ? ` (got: ${JSON.stringify(e.value)})` : ""}` +
+        (hint ? `\n    → ${hint}` : "")
+      );
+    })
+    .join("\n");
+}
+
+export type RouteContext = { method: string; path: string };
+
+export function routeHint(err: SimproError, ctx: RouteContext | undefined): string | undefined {
+  if (!ctx || err.status !== 404) return undefined;
+  const errors = (err.body as { errors?: SimproFieldError[] } | undefined)?.errors ?? [];
+  if (!errors.some((e) => /invalid route/i.test(e.message ?? ""))) return undefined;
+  const near = closestRoutes(ctx.method, ctx.path);
+  if (!near.length) return "→ Simpro has no such route. Use find_operation to get the exact path.";
+  return `→ Simpro has no such route. Closest ${ctx.method} routes: ${near.join(", ")}. Use find_operation if none fit.`;
+}
+
+export function fail(err: unknown, ctx?: RouteContext) {
   let msg: string;
   if (err instanceof SimproError) {
     const body = err.body as { errors?: SimproFieldError[] } | undefined;
     if (body?.errors?.length) {
-      const lines = body.errors.map((e) => {
-        const hint = footgunHint(e);
-        return (
-          `  - ${e.path ?? "(root)"}: ${e.message}${e.value !== undefined && e.value !== null ? ` (got: ${JSON.stringify(e.value)})` : ""}` +
-          (hint ? `\n    → ${hint}` : "")
-        );
-      });
-      msg = `${err.message}\n${lines.join("\n")}`;
+      msg = `${err.message}\n${formatFieldErrors(body.errors)}`;
     } else {
       msg = `${err.message}${err.body ? `\n${JSON.stringify(err.body)}` : ""}`;
     }
+    const hint = routeHint(err, ctx);
+    if (hint) msg += `\n${hint}`;
   } else {
     msg = err instanceof Error ? err.message : String(err);
   }
   return { isError: true, content: [{ type: "text" as const, text: msg }] };
 }
+
+type BulkItem = { status: number; headers?: Record<string, unknown>; body?: unknown };
+
+function isBulkResponse(body: unknown): body is BulkItem[] {
+  return (
+    Array.isArray(body) &&
+    body.length > 0 &&
+    body.every((r) => r && typeof r === "object" && typeof (r as BulkItem).status === "number")
+  );
+}
+
+// A /multiple/ call answers 200 even when every item inside failed, so lead with the tally.
+export function summarizeBulk(body: unknown): unknown {
+  if (!isBulkResponse(body)) return body;
+  const failed = body.filter((r) => r.status >= 400);
+  const summary: Record<string, unknown> = {
+    bulk: { total: body.length, succeeded: body.length - failed.length, failed: failed.length },
+  };
+  if (failed.length) {
+    summary.failures = failed.map((r) => {
+      const errors = (r.body as { errors?: SimproFieldError[] } | undefined)?.errors;
+      return {
+        batchId: r.headers?.["Batch-ID"],
+        status: r.status,
+        errors: errors?.length ? formatFieldErrors(errors) : r.body,
+      };
+    });
+  }
+  summary.results = body;
+  return summary;
+}
+
+// Each update/delete is its own request, so this bounds a call to a few seconds at the shared ~8 req/s.
+const MAX_LINE_ITEM_OPS = 50;
 
 const entityArg = z
   .enum(["job", "quote"])
@@ -136,6 +220,7 @@ export function registerTools(
   versionChecker?: VersionChecker,
 ): void {
   const defaultPageSize = cfg.defaultPageSize;
+  const uploads = sharedUploadStore({ maxUploadBytes: cfg.maxUploadBytes, memoryBytes: cfg.uploadMemoryBytes });
 
   // Surface a "new version available" notice as an extra content block on the FIRST tool result
   // of this server's lifetime, then latch off. stdio = one long-lived server, so this fires once
@@ -157,10 +242,10 @@ export function registerTools(
   const okWrite = async (
     method: "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
-    opts: { body?: unknown; query?: Record<string, unknown>; mergeMode?: boolean } = {},
+    opts: { body?: unknown; query?: Record<string, unknown> } = {},
   ) => {
     const { body, resourceId } = await client.requestWithReceipt(method, path, opts);
-    return ok(writeReceipt(body, resourceId));
+    return ok(writeReceipt(summarizeBulk(body), resourceId));
   };
 
   server.registerTool(
@@ -168,14 +253,14 @@ export function registerTools(
     {
       title: "Find Work (Jobs/Quotes)",
       description:
-        "Search or browse jobs or quotes. Set entity to 'job' or 'quote'. Pass `keywords` for free-text matching on the Name (handled internally as a wildcard filter). Use `filters` for server-side narrowing (e.g. { Stage: 'Pending', Customer: 131 }); filters support operators like gt()/between()/in() and nested columns (Customer.ID). Returns one page as { rows, pagination: { page, totalPages, totalRows } }; request later pages with `page`. Returns a lean column set; `columns` adds more (a large pageSize with many columns can exceed the response budget — keep one or the other modest).",
+        "Search or browse jobs or quotes. Set entity to 'job' or 'quote'. Pass `keywords` for free-text matching on the Name (handled internally as a wildcard filter). Use `filters` for server-side narrowing (e.g. { Stage: 'InProgress', Customer: 131 }). Stage values differ by entity: quotes are InProgress | Complete | Approved; jobs are Pending | Progress | Complete | Invoiced | Archived. Filters support operators like gt()/between()/in() and nested columns (Customer.ID). Returns one page as { rows, pagination: { page, totalPages, totalRows } }; request later pages with `page`. Returns a lean column set; `columns` adds more (a large pageSize with many columns can exceed the response budget — keep one or the other modest).",
       inputSchema: {
         entity: entityArg,
         keywords: z.string().optional().describe("Free-text to match on the work Name (e.g. 'Croydon'). Applied internally as a wildcard Name filter; this is plain text, not a Simpro search scheme."),
         filters: z
           .record(z.union([z.string(), z.number(), z.boolean()]))
           .optional()
-          .describe("Server-side column filters { Column: value }, e.g. { Stage: 'Pending', Total: 'gt(5000)' }."),
+          .describe("Server-side column filters { Column: value }, e.g. { Stage: 'InProgress', Total: 'gt(5000)' }. Quote stages: InProgress | Complete | Approved. Job stages: Pending | Progress | Complete | Invoiced | Archived."),
         matchScheme: matchSchemeArg,
         columns: z.array(z.string()).optional().describe("Columns to return (omit for default)."),
         page: z.number().int().positive().optional(),
@@ -228,7 +313,10 @@ export function registerTools(
     {
       title: "Create Work (Job/Quote)",
       description:
-        "Create a new job or quote. Simpro requires three fields for both: a Customer (ID), a Site (ID), and a Type ('Project' | 'Service' | 'Prepaid'). A customer's sites are listed at /customers/{id}/sites/. A brand-new customer has no site until one is created at POST /customers/{id}/sites/. Other fields (Name, Description, DueDate, …) go in `fields`.",
+        "Create a new job or quote. Simpro requires three fields for both: a Customer (ID), a Site (ID), and a Type ('Project' | 'Service' | 'Prepaid'). " +
+        "Find a customer's sites with simpro_api_get path 'sites/' and query { 'Customers.ID': <customerID>, columns: 'ID,Name,Address' }. " +
+        "A brand-new customer has no site until one is created with simpro_api_post path 'sites/' and body { Name, Address?, Customers: [<customerID>] }. " +
+        "Other fields (Name, Description, DueDate, …) go in `fields`. Description is rich text (HTML): plain-text line breaks are collapsed, so use <p>, <br>, <strong> and <ul><li>.",
       inputSchema: {
         entity: entityArg,
         customer: z.number().int().positive().describe("Customer ID (required)."),
@@ -236,7 +324,7 @@ export function registerTools(
           .number()
           .int()
           .positive()
-          .describe("Site ID (required by Simpro). A customer's sites: /customers/{id}/sites/."),
+          .describe("Site ID (required by Simpro). A customer's sites: GET sites/ filtered by { 'Customers.ID': <customerID> }."),
         type: workTypeArg,
         fields: z.record(z.unknown()).optional().describe("Additional body fields, merged in."),
       },
@@ -259,14 +347,17 @@ export function registerTools(
     {
       title: "Get Breakdown",
       description:
-        "Get a job/quote's structure in one call: every section with its cost centers. Each cost center carries an `itemCounts` map (e.g. { prebuild: 4 }) showing how many line items of each type it holds — call list_line_items once per populated type instead of probing all seven. The line items themselves are read with list_line_items.",
+        "Get a job/quote's structure in one call: every section with its cost centers. Each cost center carries an `itemCounts` map (e.g. { prebuild: 4 }) showing how many line items of each type it holds — call list_line_items once per populated type instead of probing all seven. " +
+        "Pass items:true to also get every cost center's line items inline from the same call (each with its ID, description, qty and sell price) — use this to scan many cost centers or quotes without a list_line_items call each. " +
+        "Inline items don't include PartNo, EstimatedCost or other cost fields; read those with list_line_items.",
       inputSchema: {
         entity: entityArg,
         id: z.number().int().positive().describe("The job/quote Simpro ID."),
+        items: z.boolean().optional().describe("Include each cost center's line items inline (no extra calls). Default false."),
       },
       annotations: { title: "Get Breakdown", readOnlyHint: true },
     },
-    async ({ entity, id }) => {
+    async ({ entity, id, items }) => {
       try {
         const work = (await client.get(`${base(entity)}/${id}`, { display: "all" })) as Record<string, any>;
         const sections = (Array.isArray(work.Sections) ? work.Sections : []).map((s: any) => ({
@@ -275,7 +366,7 @@ export function registerTools(
           DisplayOrder: s.DisplayOrder,
           costCenters: (Array.isArray(s.CostCenters) ? s.CostCenters : []).map((cc: any) => {
             const { Items, ...rest } = cc;
-            return { ...rest, itemCounts: countItems(Items) };
+            return { ...rest, itemCounts: countItems(Items), ...(items ? { items: Items ?? {} } : {}) };
           }),
         }));
         return okLean({ entity, id, sections });
@@ -300,7 +391,9 @@ export function registerTools(
     {
       title: "List Line Items",
       description:
-        "List line items of one type within a cost center. Get sectionID + costCenterID from get_breakdown (its itemCounts tells you which types are populated, so you can call this once per populated type instead of probing all seven). Returns { rows, _lean }: each row's SellPrice is slimmed to ExTax (+ ExDiscountExTax only when a discount applies) and the _lean note on the result states the leaning rule.",
+        "List line items of one type within a cost center. Get sectionID + costCenterID from get_breakdown (its itemCounts tells you which types are populated, so you can call this once per populated type instead of probing all seven). Returns { rows, _lean }: each row's SellPrice is slimmed to ExTax (+ ExDiscountExTax only when a discount applies) and the _lean note on the result states the leaning rule. " +
+        "Valid `columns` vary by type and an unknown one is a 422 (there is no CostPrice; a line's cost is EstimatedCost). " +
+        "describe_operation with GET on the cost center's item collection lists the valid columns for any type.",
       inputSchema: { ...itemLocator, columns: z.array(z.string()).optional() },
       annotations: { title: "List Line Items", readOnlyHint: true },
     },
@@ -314,93 +407,95 @@ export function registerTools(
     },
   );
 
+  // Fresh schemas per branch: shared ones serialize as a $ref that some MCP clients don't resolve.
+  const lineItemType = () => z.enum(ITEM_TYPE_KEYS).describe(itemLocator.itemType.description ?? "");
+  const lineItemFields = () => z.record(z.unknown());
+  const lineItemOp = z.discriminatedUnion("op", [
+    z.object({
+      op: z.literal("add"),
+      itemType: lineItemType(),
+      fields: lineItemFields().describe("Body for the new line (required fields per type are in the tool description)."),
+    }),
+    z.object({
+      op: z.literal("update"),
+      itemType: lineItemType(),
+      itemID: z.number().int().positive().describe("The line's own ID (from list_line_items), not its catalog/anchor ID."),
+      fields: lineItemFields().describe("Fields to change (PATCH: omit what stays the same)."),
+    }),
+    z.object({
+      op: z.literal("delete"),
+      itemType: lineItemType(),
+      itemID: z.number().int().positive().describe("The line's own ID (from list_line_items)."),
+    }),
+  ]);
+
   server.registerTool(
-    "add_line_item",
+    "manage_line_items",
     {
-      title: "Add Line Item",
+      title: "Manage Line Items",
       description:
-        "Add a line item to a cost center. Routes to the correct collection for itemType. The result carries `resourceId` — the new line item's id — so a retry that lost the response can confirm-by-id rather than duplicating. Required fields per type — " +
+        "Add, update and delete line items in one cost center, one or many per call. Each op names its own itemType and the tool routes it to the right Simpro collection. " +
+        "Ops run in the order given; consecutive adds of the same type are sent as one bulk request. " +
+        "add — required fields per type: " +
         ITEM_TYPE_KEYS.map((k) => `${k}: ${ITEM_TYPES[k].createHint}`).join("; ") +
-        ". The catalog/labor/prebuild anchor fields take a numeric ID; find_materials resolves a catalog or prebuild ID from a name or part number.",
+        ". The catalog/labor/prebuild anchor fields take a numeric ID; find_materials resolves a catalog or prebuild ID from a name or part number. " +
+        "update — PATCH by the line's own itemID (from list_line_items); only the fields you pass change. Qty via fields.Total ({ Qty }); a oneOff's sell price via fields.SellPriceExDiscount (number), never SellPrice: { ExTax }. " +
+        "To change which catalog/labor/prebuild a line points at, delete it and add the new one. " +
+        "asset lines can't be updated and stock lines can't be deleted; such ops are rejected before anything is written. " +
+        "To raise the qty of a line that already exists, update its Total.Qty rather than adding the item again (an add always creates a new line). " +
+        "Simpro has no transactions: on the first failed op the rest are skipped (unless continueOnError) and the result lists what was done, what failed and what was skipped. " +
+        "Single adds, updates and deletes carry `resourceId`; bulk adds return a per-item status tally.",
       inputSchema: {
-        ...itemLocator,
-        fields: z.record(z.unknown()).describe("Body fields for the new item (see required per type)."),
+        entity: itemLocator.entity,
+        id: itemLocator.id,
+        sectionID: itemLocator.sectionID,
+        costCenterID: itemLocator.costCenterID,
+        ops: z.array(lineItemOp).min(1).max(MAX_LINE_ITEM_OPS).describe(`Line item operations, run in order (max ${MAX_LINE_ITEM_OPS}).`),
+        continueOnError: z.boolean().optional().describe("Keep running later ops after one fails. Default false (stop at the first failure)."),
       },
-      annotations: { title: "Add Line Item", readOnlyHint: false },
+      annotations: { title: "Manage Line Items", readOnlyHint: false, destructiveHint: true },
     },
-    async ({ entity, id, sectionID, costCenterID, itemType, fields }) => {
-      try {
-        const path = itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType);
-        return await okWrite("POST", path, { body: fields });
-      } catch (e) {
-        return fail(e);
-      }
-    },
-  );
+    async ({ entity, id, sectionID, costCenterID, ops, continueOnError }) => {
+      const invalid = validateLineItemOps(ops as LineItemOp[]);
+      if (invalid.length) return fail(new Error(`Nothing was written.\n${invalid.join("\n")}`));
 
-  const updatableTypes = ITEM_TYPE_KEYS.filter((k) => ITEM_TYPES[k].canUpdate);
-  server.registerTool(
-    "update_line_item",
-    {
-      title: "Update Line Item",
-      description:
-        "Update one existing line item in place (PATCH — only the fields you pass change). Routes to the correct collection for itemType; `itemID` is the line item's own id (from list_line_items), not its catalog/anchor id. " +
-        `Updatable types: ${updatableTypes.join(", ")}. ` +
-        "assets have no update endpoint — delete and re-add instead. " +
-        "Common edits: Qty via fields.Total ({ Qty }); a oneOff's sell price via fields.SellPriceExDiscount (number) — never POST SellPrice: { ExTax } (read-only shape). To change a line's catalog/labor/prebuild item, delete it and add the new one rather than swapping the anchor.",
-      inputSchema: {
-        ...itemLocator,
-        itemID: z.number().int().positive().describe("The line item's own ID (from list_line_items), i.e. the id under the cost center's item collection."),
-        fields: z.record(z.unknown()).describe("Fields to change (PATCH semantics — omit what stays the same)."),
-      },
-      annotations: { title: "Update Line Item", readOnlyHint: false },
-    },
-    async ({ entity, id, sectionID, costCenterID, itemType, itemID, fields }) => {
-      try {
-        if (!ITEM_TYPES[itemType as ItemType].canUpdate) {
-          return fail(
-            new Error(
-              `Item type '${itemType}' has no Simpro update endpoint. Delete the line and re-add it (use simpro_api_delete then add_line_item).`,
-            ),
-          );
+      const steps = planLineItemOps(ops as LineItemOp[]);
+      const results: Record<string, unknown>[] = [];
+      let failed = 0;
+      let skipped = 0;
+      for (const step of steps) {
+        const summary: Record<string, unknown> = { ops: step.indexes, op: step.op, itemType: step.itemType };
+        if ("itemID" in step) summary.itemID = step.itemID;
+        if (failed && !continueOnError) {
+          skipped += step.indexes.length;
+          results.push({ ...summary, status: "skipped" });
+          continue;
         }
-        const path = `${itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType)}${itemID}`;
-        return await okWrite("PATCH", path, { body: fields });
-      } catch (e) {
-        return fail(e);
+        const collection = itemCollectionPath(entity, id, sectionID, costCenterID, step.itemType);
+        try {
+          if (step.op === "add" && step.bodies.length > 1) {
+            const bulk = summarizeBulk(
+              await client.post(`${collection}multiple/`, step.bodies),
+            ) as { bulk?: { failed: number } };
+            const bad = bulk.bulk?.failed ?? 0;
+            if (bad) failed += bad;
+            results.push({ ...summary, status: bad ? "failed" : "ok", result: bulk });
+            continue;
+          }
+          const [method, path, body] =
+            step.op === "add"
+              ? (["POST", collection, step.bodies[0]] as const)
+              : step.op === "update"
+                ? (["PATCH", `${collection}${step.itemID}`, step.fields] as const)
+                : (["DELETE", `${collection}${step.itemID}`, undefined] as const);
+          const { resourceId } = await client.requestWithReceipt(method, path, { body });
+          results.push({ ...summary, status: "ok", ...(resourceId !== undefined ? { resourceId } : {}) });
+        } catch (e) {
+          failed += step.indexes.length;
+          results.push({ ...summary, status: "failed", error: fail(e).content[0].text });
+        }
       }
-    },
-  );
-
-  server.registerTool(
-    "bulk_upsert_items",
-    {
-      title: "Bulk Upsert Line Items",
-      description:
-        "Add, merge, or replace many line items of one type in a cost center in a single call. " +
-        "mode='append' creates new items; mode='merge' increases the Qty of matching existing items " +
-        "(Post-Mode: merge); mode='replace' deletes all existing items of that type and inserts these (PUT). " +
-        "append/merge use Simpro's bulk route and return a per-item status array (Batch-ID / Resource-ID / Location, " +
-        "not the full item bodies); the created items are then readable via list_line_items. " +
-        "Required fields per item type — " +
-        ITEM_TYPE_KEYS.map((k) => `${k}: ${ITEM_TYPES[k].createHint}`).join("; ") + ".",
-      inputSchema: {
-        ...itemLocator,
-        mode: z
-          .enum(["append", "merge", "replace"])
-          .describe("append = add new (POST); merge = increment matching Qty (POST + Post-Mode: merge); replace = overwrite all (PUT)."),
-        items: z.array(z.record(z.unknown())).min(1).describe("Array of item bodies (see required fields per type)."),
-      },
-      annotations: { title: "Bulk Upsert Line Items", readOnlyHint: false, destructiveHint: true },
-    },
-    async ({ entity, id, sectionID, costCenterID, itemType, mode, items }) => {
-      try {
-        const path = itemCollectionPath(entity, id, sectionID, costCenterID, itemType as ItemType);
-        if (mode === "replace") return ok(await client.put(path, items));
-        return ok(await client.post(`${path}multiple/`, items, { mergeMode: mode === "merge" }));
-      } catch (e) {
-        return fail(e);
-      }
+      return ok({ total: ops.length, failed, skipped, results });
     },
   );
 
@@ -455,6 +550,106 @@ export function registerTools(
         const src = (await client.get(`${b}/${id}`, { display: "all" })) as Record<string, any>;
         const body = buildDuplicateBody(entity, src, { intoCustomer, name });
         return await okWrite("POST", `${b}/`, { body });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "start_attachment_upload",
+    {
+      title: "Start Attachment Upload",
+      description:
+        "Begin attaching a file (up to 50 MB) to a quote or job in pieces. Use this for any file over about 700 KB: Simpro's " +
+        "attachment route takes the whole file base64-encoded in one request, which is too large for one connector call beyond that size. " +
+        "Order: start_attachment_upload once → upload_attachment_chunk per piece (any order, resends overwrite) → finish_attachment_upload → poll attachment_upload_status until done/failed. " +
+        `Split the raw file into ${CHUNK_MAX_BYTES} bytes per chunk or fewer (before base64); a small file is just one chunk. ` +
+        `Allowed types: ${ALLOWED_EXTENSIONS.join(" ")}. The file is posted byte-for-byte under its original name.`,
+      inputSchema: {
+        entity: entityArg,
+        id: z.number().int().positive().describe("Quote or job ID to attach to."),
+        filename: z.string().min(1).describe("Original filename including extension; spaces and brackets are kept."),
+        size: z.number().int().positive().describe("Total file size in bytes."),
+        sha256: z.string().describe("Hex SHA-256 of the whole file, checked after joining."),
+        chunks: z.number().int().positive().describe(`Number of chunks the file will be sent in (each at most ${CHUNK_MAX_BYTES} bytes decoded).`),
+      },
+      annotations: { title: "Start Attachment Upload", readOnlyHint: false },
+    },
+    async ({ entity, id, filename, size, sha256, chunks }) => {
+      try {
+        validateStart({ filename, size, sha256, chunks }, cfg.maxUploadBytes);
+        try {
+          await client.get(`${base(entity)}/${id}`, { columns: "ID" });
+        } catch (e) {
+          if (e instanceof SimproError && e.status === 404) throw new UploadError(`${entity} ${id} does not exist in Simpro.`);
+          throw e;
+        }
+        return ok(uploads.start({ entity, id, filename, size, sha256, chunks }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "upload_attachment_chunk",
+    {
+      title: "Upload Attachment Chunk",
+      description:
+        "Send one piece of a file started with start_attachment_upload. Indexes are 0-based, may arrive in any order or in parallel, and resending an index overwrites it. " +
+        "Returns how many of the chunks have arrived.",
+      inputSchema: {
+        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+        index: z.number().int().min(0).describe("0-based chunk index."),
+        data: z.string().min(1).describe(`Base64 of this chunk's raw bytes (at most ${CHUNK_MAX_BYTES} bytes decoded).`),
+      },
+      annotations: { title: "Upload Attachment Chunk", readOnlyHint: false, idempotentHint: true },
+    },
+    async ({ uploadId, index, data }) => {
+      try {
+        return ok(uploads.putChunk(uploadId, index, data));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "finish_attachment_upload",
+    {
+      title: "Finish Attachment Upload",
+      description:
+        "Join and verify (size, SHA-256) all chunks of an upload, then attach the file to the quote/job in the background. " +
+        "Returns status 'working' (poll attachment_upload_status), or 'failed' with nothing posted if verification fails. Refused while chunks are missing (names them). Safe to call again — never attaches twice.",
+      inputSchema: {
+        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+      },
+      annotations: { title: "Finish Attachment Upload", readOnlyHint: false },
+    },
+    async ({ uploadId }) => {
+      try {
+        return ok(uploads.finish(uploadId, client));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "attachment_upload_status",
+    {
+      title: "Attachment Upload Status",
+      description:
+        "Status of a chunked attachment upload: collecting (with chunks received), working, done (with Simpro's string attachmentId), or failed (with the reason).",
+      inputSchema: {
+        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+      },
+      annotations: { title: "Attachment Upload Status", readOnlyHint: true },
+    },
+    async ({ uploadId }) => {
+      try {
+        return ok(uploads.status(uploadId));
       } catch (e) {
         return fail(e);
       }
@@ -730,7 +925,8 @@ export function registerTools(
     {
       title: "Find Simpro Operation",
       description:
-        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote or line item. Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods.",
+        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote (for line items use manage_line_items). Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods. " +
+        "Pre-builds come in two kinds with separate routes, set price (prebuilds/setPrice/{id}) and standard price (prebuilds/standardPrice/{id}); each ID answers on only one. The generic prebuilds/ list shows which via its `_href` column (request columns 'ID,Name,_href').",
       inputSchema: {
         query: z.string().describe("What you want to do, in keywords, e.g. 'list customer contacts' or 'update a quote'."),
         method: z
@@ -782,7 +978,14 @@ export function registerTools(
       try {
         const ep = getEndpoint(method, path);
         if (!ep) {
-          return fail(new Error(`No endpoint found for ${method} ${path}. Use find_operation to get the exact method + path.`));
+          const near = closestRoutes(method, path);
+          return fail(
+            new Error(
+              `No endpoint found for ${method} ${path}.` +
+                (near.length ? ` Closest ${method} routes: ${near.join(", ")}.` : "") +
+                " Use find_operation to get the exact method + path.",
+            ),
+          );
         }
         const out: Record<string, unknown> = { method: ep.method, path: ep.path, summary: ep.summary };
         if (ep.body !== undefined) out.body = ep.body;
@@ -809,8 +1012,10 @@ export function registerTools(
       inputSchema: {
         path: z
           .string()
+          .trim()
+          .min(1, "path is empty. Use find_operation to get the endpoint path.")
           .describe("Endpoint path. Catalog form with {companyID} (auto-filled) or a concrete /api/v1.0/... path."),
-        query: z.record(z.unknown()).optional().describe("Query params (columns, pageSize, page, orderby, and exact/operator column filters like { Stage: 'Pending', Total: 'gt(5000)' }). `search` here is the match scheme 'all'/'any' only, not free text."),
+        query: z.record(z.unknown()).optional().describe("Query params (columns, pageSize, page, orderby, and exact/operator column filters like { Total: 'gt(5000)' }). `search` here is the match scheme 'all'/'any' only, not free text."),
         keywords: z.string().optional().describe("Free text to match. Requires keywordColumns. Wrapped as %keywords% on each named column; multiple columns default to OR (search=any)."),
         keywordColumns: z.array(z.string()).optional().describe("Column(s) the keywords match against — e.g. ['Name'] or ['GivenName','FamilyName']. You pick these; the passthrough can't know a resource's 'name' column."),
       },
@@ -824,7 +1029,7 @@ export function registerTools(
         const q = buildSearchQuery(keywords, keywordColumns ?? [], query as Record<string, unknown> | undefined, undefined);
         return okLean(await client.request("GET", normalizePath(path), { query: q }));
       } catch (e) {
-        return fail(e);
+        return fail(e, { method: "GET", path });
       }
     },
   );
@@ -947,6 +1152,8 @@ export function registerTools(
 
   const writePath = z
     .string()
+    .trim()
+    .min(1, "path is empty. Use find_operation to get the endpoint path.")
     .describe("Endpoint path. Catalog form with {companyID} (auto-filled) or a concrete /api/v1.0/... path.");
 
   server.registerTool(
@@ -967,7 +1174,7 @@ export function registerTools(
       try {
         return await okWrite(method ?? "POST", normalizePath(path), { query, body });
       } catch (e) {
-        return fail(e);
+        return fail(e, { method: method ?? "POST", path });
       }
     },
   );
@@ -989,7 +1196,7 @@ export function registerTools(
       try {
         return await okWrite("PUT", normalizePath(path), { query, body });
       } catch (e) {
-        return fail(e);
+        return fail(e, { method: "PUT", path });
       }
     },
   );
@@ -1010,13 +1217,13 @@ export function registerTools(
       try {
         return ok(await client.request("DELETE", normalizePath(path), { query }));
       } catch (e) {
-        return fail(e);
+        return fail(e, { method: "DELETE", path });
       }
     },
   );
 }
 
-function normalizePath(path: string): string {
+export function normalizePath(path: string): string {
   const p = path.trim();
   const m = p.match(/\/api\/v1\.0\/companies\/[^/]+\/(.*)$/);
   let rel = (m ? m[1] : p).replace(/^\/+/, "");
@@ -1025,8 +1232,16 @@ function normalizePath(path: string): string {
   const query = qIdx >= 0 ? rel.slice(qIdx) : "";
   let route = qIdx >= 0 ? rel.slice(0, qIdx) : rel;
 
-  const lastSegment = route.replace(/\/+$/, "").split("/").pop() ?? "";
-  if (/^\d+$/.test(lastSegment)) {
+  // Top-level routes (currentUser, info, the companies listing) sit outside the
+  // company scope; canonicalize bare and full spellings to the api/v1.0/ form the
+  // client routes past its company pin. No company-scoped route shares these segments.
+  const bare = route.replace(/^api\/v1\.0\//, "");
+  if (topLevelRoute(bare)) route = `api/v1.0/${bare}`;
+
+  const trimmed = route.replace(/\/+$/, "");
+  const lastSegment = trimmed.split("/").pop() ?? "";
+  // Attachment file IDs are opaque strings, not numbers, but are still item routes.
+  if (/^\d+$/.test(lastSegment) || /(^|\/)attachments\/files\/[^/]+$/.test(trimmed)) {
     route = route.replace(/\/+$/, "");
   } else if (route && !route.endsWith("/")) {
     route = `${route}/`;

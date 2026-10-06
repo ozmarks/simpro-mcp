@@ -96,6 +96,7 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/login.ts` | `npm run login` entry — runs the `authorization_code` browser flow and caches the token without starting the server. |
 | `src/tools.ts` | All MCP tool registrations + helpers (~990 lines; the bulk of the logic). |
 | `src/lineItems.ts` | The 7 cost-center item types: URL segment, required anchor field, supported verbs. |
+| `src/uploads.ts` | Chunked attachment upload: in-process `UploadStore` singleton (TTL sessions, memory cap), join + SHA-256 verify, background post with dedupe + retry. |
 | `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
 | `src/format.ts` | Output shaping: HTML rich-text → compact text/markdown, recursive cleaning. |
 | `data/simpro-api-index.json` | Prebuilt index of ~1,300 endpoints (method/path/summary/tags/params). Ships with the build. |
@@ -115,8 +116,10 @@ These are non-obvious and were verified live; the code comments hold the full de
   `404 Invalid route`. `normalizePath()` keys off whether the last segment is numeric.
 - **Bulk routes use `/multiple/`.** POSTing an *array* to a bare collection makes Simpro
   read index 0 as a column name (`422 /0: Invalid column`). For many items, append
-  `/multiple/` (see `bulk_upsert_items`). `Post-Mode: merge` header increments matching
-  Qty; it's documented but not in Swagger.
+  `/multiple/` (see `manage_line_items`).
+- **`Post-Mode: merge` doesn't work.** Simpro documents it (increment a matching line's Qty), but
+  live it 422s with a bogus "currently opened by another user" lock error on both `/multiple/` and
+  the bare collection, even while holding the lock. To bump a qty, PATCH the line's `Total.Qty`.
 - **Writes often return 204 No Content** → `data` is `undefined`. `ok()` serializes that
   to `{success:true}` so a successful write doesn't look like a JSON error.
 - **Rate limit is 10 req/s per integration**, shared across all users on the Cowork
@@ -130,6 +133,29 @@ These are non-obvious and were verified live; the code comments hold the full de
   10/s ceiling makes scaling out pointless. Simpro sends no `Retry-After`/rate-limit
   headers, so 429 uses our own exponential backoff with jitter (capped under
   Cowork's 30s/call budget).
+- **Attachments are whole-file only.** `POST {quotes|jobs}/{id}/attachments/files/` takes
+  `{Filename, Base64Data}` in one request; there is no append, so `*_attachment_upload*` tools
+  join chunks in-process first. Attachment `ID`s are **strings**, not numbers. Upload sessions
+  live in a process-wide singleton (same single-instance assumption as the limiter), and the
+  background post uses the bearer from the `finish` request, which HTTP modes can't refresh.
+- **Bulk `/multiple/` answers 200 even when items fail.** Each element carries its own
+  `status`; `summarizeBulk()` leads the result with a `{total, succeeded, failed}` tally and
+  the failed items' errors so a batch of 404s can't read as success.
+- **Open records are locked.** Simpro locks a quote, job, cost centre (and other records) while
+  someone has it open in the UI; writes 422 with "This quote is currently locked by <name>".
+  There are POST/DELETE `…/lock/` routes but no GET, so a lock can't be inspected or waited on.
+  `footgunHint()` tells the agent to have the user close the item in Simpro. Never DELETE the
+  lock to force a write.
+- **Pre-builds are set price or standard price, on separate routes.** Each ID answers on only
+  one of `prebuilds/setPrice/{id}` / `prebuilds/standardPrice/{id}` (the other 404s "…-price
+  prebuild not found"); the generic `prebuilds/` list shows which via `_href`. A standard-price
+  pre-build's price can't be set via `TotalEx` (422 "add a default labour rate") or with
+  `MaterialSale: 'Default'` (422); send `MaterialSale: 'None'` + `MaterialSellPrice`, and attach
+  materials first: without them a bulk update reports success but the price stays 0.
+- **Sites are top-level.** List a customer's sites at `sites/` filtered by `Customers.ID`;
+  create with `Customers: [id]`. `customers/{id}/sites/` doesn't exist.
+- **Quote/job `Description` is rich text (HTML)**; plain-text line breaks collapse. Cost centre
+  `Notes` are plain text.
 - **`oneOff` sell price**: write `SellPriceExDiscount` (number) or
   `EstimatedCost`+`Markup`; never POST `SellPrice: { ExTax }` (that's the read shape →
   422). See `ITEM_TYPES.oneOff.createHint`.
