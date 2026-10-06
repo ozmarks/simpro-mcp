@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { topLevelRoute } from "./simproClient.js";
 
 export interface Endpoint {
   method: string;
@@ -106,9 +107,11 @@ function pathKey(path: string): string {
   if (m) rel = m[1];
   const qIdx = rel.indexOf("?");
   if (qIdx >= 0) rel = rel.slice(0, qIdx);
+  rel = rel.replace(/^\/+/, "").replace(/\/+$/, "");
+  // Key top-level routes under their full spelling so a bare "currentUser" matches
+  // the index's "/api/v1.0/currentUser/".
+  if (topLevelRoute(rel)) rel = `api/v1.0/${rel}`;
   return rel
-    .replace(/^\/+/, "")
-    .replace(/\/+$/, "")
     .split("/")
     .map((seg) => (/^\{.+\}$/.test(seg) || /^\d+$/.test(seg) ? "*" : seg))
     .join("/");

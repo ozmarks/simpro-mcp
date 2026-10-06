@@ -65,6 +65,14 @@ export function extractResourceId(headers: Headers): string | number | undefined
   return undefined;
 }
 
+// Simpro's few routes outside the /companies/{id}/ scope. Returns the route group of a
+// query-free, leading-slash-free relative route, or null. "companies" counts only as the
+// bare listing — a companies/{otherID}/... path must not sidestep the company pin in url().
+export function topLevelRoute(route: string): string | null {
+  const m = /^(?:(currentUser|info)(?:\/|$)|(companies)\/*$)/.exec(route);
+  return m ? (m[1] ?? m[2] ?? null) : null;
+}
+
 export class SimproClient {
   private readonly limiter = sharedLimiter;
   private static readonly MAX_429_RETRIES = 4;
@@ -92,16 +100,28 @@ export class SimproClient {
 
   private url(path: string, query?: Record<string, unknown>): string {
     const clean = path.replace(/^\/+/, "");
+    // An api/v1.0/-prefixed path is routed from the API root (normalizePath produces
+    // this form for Simpro's top-level routes); everything else stays company-scoped.
+    const top = clean.startsWith("api/v1.0/")
+      ? topLevelRoute(clean.slice("api/v1.0/".length).split("?")[0])
+      : null;
     const u = new URL(
-      `${this.cfg.baseUrl}/api/v1.0/companies/${this.cfg.companyId}/${clean}`,
+      top
+        ? `${this.cfg.baseUrl}/${clean}`
+        : `${this.cfg.baseUrl}/api/v1.0/companies/${this.cfg.companyId}/${clean}`,
     );
-    // Pin to the company prefix so "../" segments can't escape the company scope.
+    // Pin to the route's scope so "../" segments can't escape it.
     const allowed = new URL(
-      `${this.cfg.baseUrl}/api/v1.0/companies/${this.cfg.companyId}/`,
+      top
+        ? `${this.cfg.baseUrl}/api/v1.0/${top}/`
+        : `${this.cfg.baseUrl}/api/v1.0/companies/${this.cfg.companyId}/`,
     );
-    if (u.origin !== allowed.origin || !u.pathname.startsWith(allowed.pathname)) {
+    if (
+      u.origin !== allowed.origin ||
+      !(u.pathname.startsWith(allowed.pathname) || `${u.pathname}/` === allowed.pathname)
+    ) {
       throw new SimproError(
-        `Invalid path "${path}": resolves outside the company API scope (${allowed.pathname}).`,
+        `Invalid path "${path}": resolves outside the allowed API scope (${allowed.pathname}).`,
         400,
       );
     }
