@@ -95,6 +95,7 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/auth/authCodeFlow.ts` | One-time browser login over a fixed-port localhost callback; returns the Simpro refresh token. |
 | `src/login.ts` | `npm run login` entry — runs the `authorization_code` browser flow and caches the token without starting the server. |
 | `src/tools.ts` | All MCP tool registrations + helpers (~990 lines; the bulk of the logic). |
+| `src/billing.ts` | Pure logic for `find_unsent_invoices` / `find_uninvoiced_work`: cutoff resolution, schedule/claim/invoice joins. |
 | `src/lineItems.ts` | The 7 cost-center item types: URL segment, required anchor field, supported verbs. |
 | `src/uploads.ts` | Chunked attachment upload: in-process `UploadStore` singleton (TTL sessions, memory cap), join + SHA-256 verify, background post with dedupe + retry. |
 | `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
@@ -156,6 +157,13 @@ These are non-obvious and were verified live; the code comments hold the full de
   create with `Customers: [id]`. `customers/{id}/sites/` doesn't exist.
 - **Quote/job `Description` is rich text (HTML)**; plain-text line breaks collapse. Cost centre
   `Notes` are plain text.
+- **Schedules can't be filtered by job directly.** `Project.ProjectID` 422s ("does not allow search requests
+  on its child objects") and `Reference=in(...)` 422s ("cannot contain more than 1 '-'"). `Reference=<jobID>`
+  (a bare job ID) matches every `<jobID>-<costCenterID>` booking for that job, so it's one call per job.
+- **Unclaimed cost centres omit `Claimed`.** On `jobs/` with `display=all`, a cost centre never invoiced has no
+  `Claimed` block; treat it as 0% claimed. `invoices/` accepts `Jobs.ID=in(...)`.
+- **Invoice sends are only visible in the log.** `logs/customerInvoices/` gets an `Emailed <recipients> Invoice no. N`
+  line per send; `Message` takes a case-insensitive `%wildcard%` filter and combines with `CustomerInvoiceID=in(...)`.
 - **`oneOff` sell price**: write `SellPriceExDiscount` (number) or
   `EstimatedCost`+`Markup`; never POST `SellPrice: { ExTax }` (that's the read shape →
   422). See `ITEM_TYPES.oneOff.createHint`.

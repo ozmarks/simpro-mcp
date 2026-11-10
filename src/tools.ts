@@ -16,6 +16,18 @@ import {
 import { selectRecords, columnsForFields, describeRecord } from "./select.js";
 import type { VersionChecker, UpdateInfo } from "./versionCheck.js";
 import { sharedUploadStore, validateStart, UploadError, CHUNK_MAX_BYTES, ALLOWED_EXTENSIONS } from "./uploads.js";
+import {
+  chunk,
+  mapLimit,
+  isIsoDate,
+  localToday,
+  resolveCutoff,
+  wildcard,
+  shapeUnsentInvoices,
+  buildUninvoicedReport,
+  type ScheduleRow,
+  type JobCostCenterRow,
+} from "./billing.js";
 
 // One-line agent-facing update notice (stdio surfaces it on a tool result; HTTP logs it instead).
 export function formatUpdateNotice(u: UpdateInfo): string {
@@ -164,6 +176,7 @@ export function summarizeBulk(body: unknown): unknown {
 
 // Each update/delete is its own request, so this bounds a call to a few seconds at the shared ~8 req/s.
 const MAX_LINE_ITEM_OPS = 50;
+const MAX_UNINVOICED_JOBS = 200;
 
 const entityArg = z
   .enum(["job", "quote"])
@@ -842,6 +855,179 @@ export function registerTools(
           { filters: { "Customer.ID": customerID, IsPaid: false }, allPages: true },
         );
         return ok(ageReceivables(rows, asOf, customerID));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "find_unsent_invoices",
+    {
+      title: "Find Unsent Invoices",
+      description:
+        "Unpaid customer invoices that have NO invoice-log entry containing `messageContains` (default 'Emailed'), i.e. " +
+        "invoices that were never emailed to the customer. Simpro writes a log line like 'Emailed <recipient> Invoice no. 1234' " +
+        "each time an invoice is sent; this checks for the presence of any such line, not the latest one. Credits are excluded " +
+        "unless includeCredits is true. Matching is case-insensitive substring on the log Message. Read-only.",
+      inputSchema: {
+        messageContains: z
+          .string()
+          .trim()
+          .min(1)
+          .default("Emailed")
+          .describe("Substring to look for in the invoice log Message (case-insensitive). Default 'Emailed'. Pass e.g. a domain to check sends to a specific recipient."),
+        customerID: z.number().int().positive().optional().describe("Only this customer's invoices."),
+        issuedFrom: z.string().optional().describe("Only invoices issued on/after this date (YYYY-MM-DD)."),
+        issuedTo: z.string().optional().describe("Only invoices issued on/before this date (YYYY-MM-DD)."),
+        includeCredits: z.boolean().default(false).describe("Include credit notes (default false)."),
+        asOf: z.string().optional().describe("Reference date for daysSinceIssued (YYYY-MM-DD, default today)."),
+      },
+      annotations: { title: "Find Unsent Invoices", readOnlyHint: true },
+    },
+    async ({ messageContains, customerID, issuedFrom, issuedTo, includeCredits, asOf }) => {
+      try {
+        for (const [k, v] of Object.entries({ issuedFrom, issuedTo, asOf })) {
+          if (v && !isIsoDate(v)) return fail(new Error(`${k} must be YYYY-MM-DD (got "${v}").`));
+        }
+        const filters: Record<string, unknown> = { IsPaid: false };
+        if (!includeCredits) filters.IsCredit = false;
+        if (customerID) filters["Customer.ID"] = customerID;
+        if (issuedFrom && issuedTo) filters.DateIssued = `between(${issuedFrom},${issuedTo})`;
+        else if (issuedFrom) filters.DateIssued = `ge(${issuedFrom})`;
+        else if (issuedTo) filters.DateIssued = `le(${issuedTo})`;
+
+        const { rows: invoices } = await fetchProjected(
+          client,
+          "customerInvoices/",
+          ["ID", "Customer", "Jobs", "Stage", "Status", "DateIssued", "DueDate", "Total", "IsCredit"],
+          { filters, allPages: true },
+        );
+
+        // One log query per batch of invoice IDs, filtered server-side to matching messages only.
+        const ids = invoices.map((r) => Number(r.ID)).filter(Number.isFinite);
+        const matched = new Set<number>();
+        await mapLimit(chunk(ids, 100), 3, async (batch) => {
+          const logs = await client.getAllPages("logs/customerInvoices/", {
+            CustomerInvoiceID: `in(${batch.join(",")})`,
+            Message: wildcard(messageContains),
+            columns: "ID,CustomerInvoiceID",
+          });
+          for (const l of logs as Array<Record<string, unknown>>) matched.add(Number(l.CustomerInvoiceID));
+        });
+
+        const today = asOf ?? localToday();
+        return ok({ messageContains, ...shapeUnsentInvoices(invoices as Array<Record<string, any>>, matched, today) });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "find_uninvoiced_work",
+    {
+      title: "Find Uninvoiced Work",
+      description:
+        "Jobs (Stage Progress or Complete) with work scheduled on or before a cutoff date that still has unclaimed value, " +
+        "reported per cost centre. A cost centre is included when it has at least one job schedule dated <= cutoff AND " +
+        "unclaimed ex-tax value remaining. Set the cutoff with cutoffDate, or offsetDays back from today (e.g. offsetDays 11 " +
+        "on 10 Nov -> work up to 30 Oct). Each cost centre carries its last scheduled date, claimed %, unclaimed value, and " +
+        "the last invoice that included it (invoicedSinceLastSchedule shows whether an invoice was issued on/after the last " +
+        "scheduled date, e.g. a partial progress claim). excludeStaffIDs drops schedules booked to those staff/crew " +
+        "(e.g. placeholder bookings). Costs one call per job, so narrow with customerID/jobIDs on large books. Read-only.",
+      inputSchema: {
+        cutoffDate: z.string().optional().describe("Only count work scheduled on/before this date (YYYY-MM-DD). Overrides offsetDays."),
+        offsetDays: z.number().int().min(0).optional().describe("Cutoff = asOf (default today) minus this many days. Default 0."),
+        asOf: z.string().optional().describe("Reference 'today' for offsetDays and daysSinceLastScheduled (YYYY-MM-DD)."),
+        scheduledFrom: z.string().optional().describe("Ignore schedules before this date (YYYY-MM-DD). Default: no lower bound."),
+        excludeStaffIDs: z.array(z.number().int().positive()).optional().describe("Staff/crew IDs whose schedules are ignored (Staff.ID on schedules)."),
+        customerID: z.number().int().positive().optional().describe("Only this customer's jobs."),
+        jobIDs: z.array(z.number().int().positive()).optional().describe("Only these jobs."),
+        minUnclaimed: z.number().min(0).optional().describe("Minimum unclaimed ex-tax value for a cost centre to be listed. Default 0.01."),
+      },
+      annotations: { title: "Find Uninvoiced Work", readOnlyHint: true },
+    },
+    async ({ cutoffDate, offsetDays, asOf, scheduledFrom, excludeStaffIDs, customerID, jobIDs, minUnclaimed }) => {
+      try {
+        for (const [k, v] of Object.entries({ asOf, scheduledFrom })) {
+          if (v && !isIsoDate(v)) return fail(new Error(`${k} must be YYYY-MM-DD (got "${v}").`));
+        }
+        const today = asOf ?? localToday();
+        const cutoff = resolveCutoff({ cutoffDate, offsetDays, asOf: today });
+        if (scheduledFrom && scheduledFrom > cutoff) {
+          return fail(new Error(`scheduledFrom (${scheduledFrom}) is after the cutoff (${cutoff}).`));
+        }
+
+        // 1. In-scope jobs, fanned out to one row per cost centre with its sell total and claim state.
+        const jobFilters: Record<string, unknown> = { Stage: "in(Progress,Complete)" };
+        if (customerID) jobFilters["Customer.ID"] = customerID;
+        if (jobIDs?.length) jobFilters.ID = `in(${jobIDs.join(",")})`;
+        const { rows: jobRows } = await fetchProjected(
+          client,
+          "jobs/",
+          [
+            "ID",
+            "Name",
+            "Stage",
+            "Customer",
+            "Sections.ID",
+            "Sections.CostCenters.ID",
+            "Sections.CostCenters.Name",
+            "Sections.CostCenters.Total.ExTax",
+            "Sections.CostCenters.Claimed",
+          ],
+          { filters: jobFilters, allPages: true },
+        );
+        const ids = [...new Set(jobRows.map((r) => Number(r.ID)).filter(Number.isFinite))];
+        if (ids.length > MAX_UNINVOICED_JOBS) {
+          return fail(
+            new Error(
+              `${ids.length} jobs are in Progress/Complete; this tool reads schedules one job at a time and caps at ` +
+                `${MAX_UNINVOICED_JOBS}. Narrow with customerID or jobIDs.`,
+            ),
+          );
+        }
+
+        // 2. Schedules per job. Simpro can't filter schedules by Project.* and rejects in() on Reference,
+        // but Reference=<jobID> matches every "<jobID>-<costCenterID>" booking for that job.
+        const dateFilter = scheduledFrom ? `between(${scheduledFrom},${cutoff})` : `le(${cutoff})`;
+        const schedulesByJob = new Map<number, ScheduleRow[]>();
+        await mapLimit(ids, 4, async (jobID) => {
+          const rows = await client.getAllPages(
+            "schedules/",
+            { Type: "job", Reference: String(jobID), Date: dateFilter, columns: "ID,Date,Reference,Staff,TotalHours" },
+            { maxPages: 10 },
+          );
+          if (rows.length) schedulesByJob.set(jobID, rows as ScheduleRow[]);
+        });
+
+        // 3. Invoices touching the scheduled jobs, one row per invoiced cost centre.
+        const scheduledJobIDs = [...schedulesByJob.keys()];
+        const invoices: Array<Record<string, unknown>> = [];
+        await mapLimit(chunk(scheduledJobIDs, 50), 2, async (batch) => {
+          const { rows } = await fetchProjected(client, "invoices/", ["ID", "DateIssued", "CostCenters.ID"], {
+            filters: { "Jobs.ID": `in(${batch.join(",")})` },
+            allPages: true,
+          });
+          invoices.push(...rows);
+        });
+
+        const report = buildUninvoicedReport(jobRows as JobCostCenterRow[], schedulesByJob, invoices, {
+          cutoff,
+          from: scheduledFrom,
+          excludeStaffIDs,
+          asOf: today,
+          minUnclaimed,
+        });
+        return ok({
+          cutoff,
+          ...(scheduledFrom ? { scheduledFrom } : {}),
+          ...(excludeStaffIDs?.length ? { excludeStaffIDs } : {}),
+          jobsChecked: ids.length,
+          jobsWithSchedules: scheduledJobIDs.length,
+          ...report,
+        });
       } catch (e) {
         return fail(e);
       }
