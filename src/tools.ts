@@ -935,7 +935,7 @@ export function registerTools(
         "on 10 Nov -> work up to 30 Oct). Each cost centre carries its last scheduled date, claimed %, unclaimed value, and " +
         "the last invoice that included it (invoicedSinceLastSchedule shows whether an invoice was issued on/after the last " +
         "scheduled date, e.g. a partial progress claim). excludeStaffIDs drops schedules booked to those staff/crew " +
-        "(e.g. placeholder bookings). Costs one call per job, so narrow with customerID/jobIDs on large books. Read-only.",
+        "(e.g. bookings for a crew that should not count as billable work). Costs one call per job, so narrow with customerID/jobIDs on large books. Read-only.",
       inputSchema: {
         cutoffDate: z.string().optional().describe("Only count work scheduled on/before this date (YYYY-MM-DD). Overrides offsetDays."),
         offsetDays: z.number().int().min(0).optional().describe("Cutoff = asOf (default today) minus this many days. Default 0."),

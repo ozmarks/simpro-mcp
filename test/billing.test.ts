@@ -51,8 +51,8 @@ test("wildcard wraps text and strips literal %", () => {
 });
 
 test("parseReference splits jobID-costCenterID and rejects other shapes", () => {
-  assert.deepEqual(parseReference("3761-12414"), { jobID: 3761, costCenterID: 12414 });
-  assert.equal(parseReference("3761"), undefined);
+  assert.deepEqual(parseReference("1001-2001"), { jobID: 1001, costCenterID: 2001 });
+  assert.equal(parseReference("1001"), undefined);
   assert.equal(parseReference(undefined), undefined);
 });
 
@@ -62,10 +62,10 @@ test("summarizeSchedules applies cutoff, from and staff exclusion per cost centr
       { Date: "2026-10-20", Reference: "1-10", TotalHours: 2, Staff: { ID: 5 } },
       { Date: "2026-10-25", Reference: "1-10", TotalHours: 3, Staff: { ID: 5 } },
       { Date: "2026-11-20", Reference: "1-10", TotalHours: 8, Staff: { ID: 5 } }, // after cutoff
-      { Date: "2026-10-26", Reference: "1-11", TotalHours: 0.5, Staff: { ID: 146 } }, // excluded crew
+      { Date: "2026-10-26", Reference: "1-11", TotalHours: 0.5, Staff: { ID: 99 } }, // excluded crew
       { Date: "2026-09-01", Reference: "1-12", TotalHours: 1, Staff: { ID: 5 } }, // before from
     ],
-    { cutoff: "2026-10-30", from: "2026-10-01", excludeStaffIDs: [146] },
+    { cutoff: "2026-10-30", from: "2026-10-01", excludeStaffIDs: [99] },
   );
   assert.deepEqual([...s.keys()], [10]);
   assert.deepEqual(s.get(10), { lastScheduled: "2026-10-25", firstScheduled: "2026-10-20", bookings: 2, hours: 5 });

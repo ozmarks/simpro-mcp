@@ -30,7 +30,7 @@ export function isIsoDate(s: string): boolean {
   return ISO_DATE.test(s) && Number.isFinite(Date.parse(`${s}T00:00:00Z`));
 }
 
-// Today's date in the server's local timezone (not UTC: a Melbourne morning is still "yesterday" in UTC).
+// Today's date in the server's local timezone (not UTC, which can be a different calendar day).
 export function localToday(now: Date = new Date()): string {
   const y = now.getFullYear();
   const m = String(now.getMonth() + 1).padStart(2, "0");
