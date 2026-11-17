@@ -6,7 +6,7 @@ FSL-1.1-ALv2
 
 ## Notice
 
-Copyright 2026 Ozmarks Group
+Copyright 2026 Ozmarks Group Pty Ltd
 
 ## Terms and Conditions
 
