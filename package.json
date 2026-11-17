@@ -5,6 +5,7 @@
     "access": "public"
   },
   "description": "Unofficial MCP server exposing Simpro operations (quotes, jobs, customers, catalog, aggregations) over stdio and streamable HTTP. Not affiliated with, endorsed by, or supported by Simpro.",
+  "license": "FSL-1.1-ALv2",
   "type": "module",
   "engines": {
     "node": ">=24"
