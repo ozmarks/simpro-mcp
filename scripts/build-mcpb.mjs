@@ -42,6 +42,8 @@ cpSync(join(repoRoot, "dist"), serverDir, {
 
 copyFileSync(join(repoRoot, "package.json"), join(serverDir, "package.json"));
 copyFileSync(join(repoRoot, "package-lock.json"), join(serverDir, "package-lock.json"));
+// FSL requires redistributed copies to carry the license terms.
+copyFileSync(join(repoRoot, "LICENSE.md"), join(serverDir, "LICENSE.md"));
 
 // --ignore-scripts: the bundle has no src/, so a prepare/build hook has nothing to do.
 log("installing production deps into mcpb/server/…");

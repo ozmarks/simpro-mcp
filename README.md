@@ -409,3 +409,13 @@ ranking, output formatting, line-item paths, and the auth crypto/store helpers. 
 linter, and nothing mocks the network, so fully checking a change still means building it
 and trying it against a real Simpro account. Architecture notes and the Simpro API quirks
 worth knowing are in `CLAUDE.md`.
+
+---
+
+## License
+
+Licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md)
+(`FSL-1.1-ALv2`). You can use, modify and redistribute it for any purpose other than a
+Competing Use (offering it, or something substantially similar, to others as a commercial
+product or service). Each release converts to the Apache License 2.0 two years after it is
+published.
