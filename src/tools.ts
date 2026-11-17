@@ -226,6 +226,15 @@ export function writeReceipt(body: unknown, resourceId: string | number | undefi
   return { resourceId, result: body };
 }
 
+export const SERVER_INSTRUCTIONS = [
+  "Tools for one connected Simpro account. Prefer the dedicated tools; for anything else, find_operation locates the endpoint and simpro_api_get / simpro_api_post / simpro_api_put / simpro_api_delete call it.",
+  "Writes change real data. Simpro has no transactions, and bulk writes report success or failure per item, so check the tally in the result.",
+  "A record someone has open in Simpro is locked: writes fail with 'currently locked by <name>'. Ask the user to close it in Simpro, then retry. Never DELETE a …/lock/ route to force a write.",
+  "Simpro's `search` query param only takes 'all' or 'any'. Match free text with wildcard column filters ({ Name: '%word%' }) or a tool's `keywords` argument.",
+  "Quote and job Description fields are HTML: use <p>, <br> and <ul><li>, since plain line breaks collapse.",
+  "A write that returns no body comes back as { success: true } with the resourceId Simpro reported.",
+].join("\n");
+
 export function registerTools(
   server: McpServer,
   client: SimproClient,
@@ -266,7 +275,7 @@ export function registerTools(
     {
       title: "Find Work (Jobs/Quotes)",
       description:
-        "Search or browse jobs or quotes. Set entity to 'job' or 'quote'. Pass `keywords` for free-text matching on the Name (handled internally as a wildcard filter). Use `filters` for server-side narrowing (e.g. { Stage: 'InProgress', Customer: 131 }). Stage values differ by entity: quotes are InProgress | Complete | Approved; jobs are Pending | Progress | Complete | Invoiced | Archived. Filters support operators like gt()/between()/in() and nested columns (Customer.ID). Returns one page as { rows, pagination: { page, totalPages, totalRows } }; request later pages with `page`. Returns a lean column set; `columns` adds more (a large pageSize with many columns can exceed the response budget — keep one or the other modest).",
+        "Search or browse jobs or quotes. `keywords` matches the Name; `filters` narrows server-side and supports operators like gt()/between()/in() and nested columns (Customer.ID). Returns one page as { rows, pagination: { page, totalPages, totalRows } }; request later pages with `page`. Returns a lean column set; `columns` adds more (a large pageSize with many columns can exceed the response budget — keep one or the other modest).",
       inputSchema: {
         entity: entityArg,
         keywords: z.string().optional().describe("Free-text to match on the work Name (e.g. 'Croydon'). Applied internally as a wildcard Name filter; this is plain text, not a Simpro search scheme."),
@@ -341,7 +350,7 @@ export function registerTools(
         type: workTypeArg,
         fields: z.record(z.unknown()).optional().describe("Additional body fields, merged in."),
       },
-      annotations: { title: "Create Work", readOnlyHint: false },
+      annotations: { title: "Create Work", readOnlyHint: false, destructiveHint: false },
     },
     async ({ entity, customer, site, type, fields }) => {
       try {
@@ -525,7 +534,7 @@ export function registerTools(
           .describe("Source type: 'lead' → quote, 'quote' → job, 'recurringJob' → job."),
         id: z.number().int().positive().describe("ID of the source lead / quote / recurring job."),
       },
-      annotations: { title: "Convert / Create From", readOnlyHint: false },
+      annotations: { title: "Convert / Create From", readOnlyHint: false, destructiveHint: false },
     },
     async ({ from, id }) => {
       try {
@@ -555,7 +564,7 @@ export function registerTools(
         intoCustomer: z.number().int().positive().optional().describe("Customer ID for the copy (defaults to the source's customer)."),
         name: z.string().optional().describe("Name for the copy (defaults to source name + ' (copy)')."),
       },
-      annotations: { title: "Duplicate Work", readOnlyHint: false },
+      annotations: { title: "Duplicate Work", readOnlyHint: false, destructiveHint: false },
     },
     async ({ entity, id, intoCustomer, name }) => {
       try {
@@ -587,7 +596,7 @@ export function registerTools(
         sha256: z.string().describe("Hex SHA-256 of the whole file, checked after joining."),
         chunks: z.number().int().positive().describe(`Number of chunks the file will be sent in (each at most ${CHUNK_MAX_BYTES} bytes decoded).`),
       },
-      annotations: { title: "Start Attachment Upload", readOnlyHint: false },
+      annotations: { title: "Start Attachment Upload", readOnlyHint: false, destructiveHint: false },
     },
     async ({ entity, id, filename, size, sha256, chunks }) => {
       try {
@@ -617,7 +626,7 @@ export function registerTools(
         index: z.number().int().min(0).describe("0-based chunk index."),
         data: z.string().min(1).describe(`Base64 of this chunk's raw bytes (at most ${CHUNK_MAX_BYTES} bytes decoded).`),
       },
-      annotations: { title: "Upload Attachment Chunk", readOnlyHint: false, idempotentHint: true },
+      annotations: { title: "Upload Attachment Chunk", readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
     async ({ uploadId, index, data }) => {
       try {
@@ -638,7 +647,7 @@ export function registerTools(
       inputSchema: {
         uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
       },
-      annotations: { title: "Finish Attachment Upload", readOnlyHint: false },
+      annotations: { title: "Finish Attachment Upload", readOnlyHint: false, destructiveHint: false },
     },
     async ({ uploadId }) => {
       try {
@@ -674,10 +683,9 @@ export function registerTools(
     {
       title: "Find Customers",
       description:
-        "Search or browse customers (both company and individual). Pass `keywords` for free-text matching on customer name " +
-        "(company name, or given/family name when type='individual') — handled internally as wildcard filters. " +
-        "Use `filters` for column filters (supports operators like gt()/between()/in() and nested columns). " +
-        "Returns ID, name, type, and the _href that identifies whether each is a company or individual.",
+        "Search or browse customers (both company and individual). `keywords` matches the customer name; " +
+        "`filters` supports operators like gt()/between()/in() and nested columns. " +
+        "Returns ID, CompanyName, GivenName, FamilyName and _href; the _href path (customers/companies/… or customers/individuals/…) tells you which kind each is.",
       inputSchema: {
         keywords: z.string().optional().describe("Free-text to match on customer name. Mapped to a wildcard name filter internally (CompanyName, or GivenName/FamilyName for individuals)."),
         type: z.enum(["company", "individual", "all"]).optional().describe("Restrict to one customer kind (default all)."),
@@ -713,8 +721,7 @@ export function registerTools(
     {
       title: "Get Customer",
       description:
-        "Get one customer's full details by ID, automatically resolving whether it is a company or an individual " +
-        "(the bare /customers/{id} route errors with the correct _href, which this follows).",
+        "Get one customer's full details by ID, whether it is a company or an individual.",
       inputSchema: {
         id: z.number().int().positive().describe("Customer ID."),
         columns: z.array(z.string()).optional(),
@@ -742,18 +749,12 @@ export function registerTools(
     {
       title: "Find Materials (catalog + prebuilds)",
       description:
-        "Resolve a product name/part number to an ID across BOTH the catalog (stocked materials/parts) AND prebuilds " +
-        "(assemblies) in one call, then say which it is. A name like '100mm solid centre line' could be either, and " +
-        "nothing in the name declares it — so this searches both master collections and tags each match with its " +
-        "`type` ('catalog' or 'prebuild'). That type tells you which line-item endpoint to POST to and which anchor " +
-        "field to use: type 'catalog' -> .../costCenters/{id}/catalogs/ with body { Catalog: <id>, ... }; type " +
-        "'prebuild' -> .../prebuilds/ with body { Prebuild: <id>, ... }. If a term matches in both, you have a genuine " +
-        "ambiguity (a part and an assembly sharing a name) - surface both to the user. Returns id, name, partNo, type " +
-        "and group per match, plus pricing: catalog matches carry tradePrice, sellPrice and uom (uom is null when " +
-        "unspecified upstream — a note lists those ids); prebuild matches carry totalEx (the assembly's standard " +
-        "build price ex-tax). The same item can appear several times under the SAME name/PartNo in different groups - " +
-        "when that happens, the group is what distinguishes them; surface the options and let the user pick rather than " +
-        "grabbing the first.",
+        "Resolve a product name or part number to an ID, searching both the catalog (materials/parts) and prebuilds " +
+        "(assemblies) in one call. Each match is tagged `type` 'catalog' or 'prebuild'; add it with manage_line_items " +
+        "using that itemType and its ID as fields.Catalog or fields.Prebuild. " +
+        "Returns id, name, partNo, type and group per match; catalog matches add tradePrice, sellPrice and uom, prebuild " +
+        "matches add totalEx (standard build price ex-tax). The result's note flags matches in both collections or " +
+        "same-name matches that differ only by group; surface those to the user rather than picking one.",
       inputSchema: {
         searchText: z
           .string()
@@ -868,8 +869,9 @@ export function registerTools(
       description:
         "Unpaid customer invoices that have NO invoice-log entry containing `messageContains` (default 'Emailed'), i.e. " +
         "invoices that were never emailed to the customer. Simpro writes a log line like 'Emailed <recipient> Invoice no. 1234' " +
-        "each time an invoice is sent; this checks for the presence of any such line, not the latest one. Credits are excluded " +
-        "unless includeCredits is true. Matching is case-insensitive substring on the log Message. Read-only.",
+        "each time an invoice is sent; this checks for the presence of any such line, not the latest one. A status of " +
+        "'Sent to Client' does not mean it was sent: Simpro sets it automatically when the invoice is viewed. Credits are excluded " +
+        "unless includeCredits is true. Matching is case-insensitive substring on the log Message.",
       inputSchema: {
         messageContains: z
           .string()
@@ -935,7 +937,7 @@ export function registerTools(
         "on 10 Nov -> work up to 30 Oct). Each cost centre carries its last scheduled date, claimed %, unclaimed value, and " +
         "the last invoice that included it (invoicedSinceLastSchedule shows whether an invoice was issued on/after the last " +
         "scheduled date, e.g. a partial progress claim). excludeStaffIDs drops schedules booked to those staff/crew " +
-        "(e.g. bookings for a crew that should not count as billable work). Costs one call per job, so narrow with customerID/jobIDs on large books. Read-only.",
+        "(e.g. bookings for a crew that should not count as billable work). Costs one call per job, so narrow with customerID/jobIDs on large books.",
       inputSchema: {
         cutoffDate: z.string().optional().describe("Only count work scheduled on/before this date (YYYY-MM-DD). Overrides offsetDays."),
         offsetDays: z.number().int().min(0).optional().describe("Cutoff = asOf (default today) minus this many days. Default 0."),
@@ -963,6 +965,15 @@ export function registerTools(
         const jobFilters: Record<string, unknown> = { Stage: "in(Progress,Complete)" };
         if (customerID) jobFilters["Customer.ID"] = customerID;
         if (jobIDs?.length) jobFilters.ID = `in(${jobIDs.join(",")})`;
+        const { pagination: jobCount } = await client.getList("jobs/", { ...jobFilters, columns: "ID", pageSize: 1 });
+        if (jobCount.totalRows > MAX_UNINVOICED_JOBS) {
+          return fail(
+            new Error(
+              `${jobCount.totalRows} jobs are in Progress/Complete; this tool reads schedules one job at a time and caps at ` +
+                `${MAX_UNINVOICED_JOBS}. Narrow with customerID or jobIDs.`,
+            ),
+          );
+        }
         const { rows: jobRows } = await fetchProjected(
           client,
           "jobs/",
@@ -980,24 +991,17 @@ export function registerTools(
           { filters: jobFilters, allPages: true },
         );
         const ids = [...new Set(jobRows.map((r) => Number(r.ID)).filter(Number.isFinite))];
-        if (ids.length > MAX_UNINVOICED_JOBS) {
-          return fail(
-            new Error(
-              `${ids.length} jobs are in Progress/Complete; this tool reads schedules one job at a time and caps at ` +
-                `${MAX_UNINVOICED_JOBS}. Narrow with customerID or jobIDs.`,
-            ),
-          );
-        }
 
         // 2. Schedules per job. Simpro can't filter schedules by Project.* and rejects in() on Reference,
         // but Reference=<jobID> matches every "<jobID>-<costCenterID>" booking for that job.
         const dateFilter = scheduledFrom ? `between(${scheduledFrom},${cutoff})` : `le(${cutoff})`;
         const schedulesByJob = new Map<number, ScheduleRow[]>();
+        const truncatedSchedules: Array<{ jobID: number; fetchedPages: number; totalPages: number }> = [];
         await mapLimit(ids, 4, async (jobID) => {
           const rows = await client.getAllPages(
             "schedules/",
             { Type: "job", Reference: String(jobID), Date: dateFilter, columns: "ID,Date,Reference,Staff,TotalHours" },
-            { maxPages: 10 },
+            { onTruncated: (info) => truncatedSchedules.push({ jobID, ...info }) },
           );
           if (rows.length) schedulesByJob.set(jobID, rows as ScheduleRow[]);
         });
@@ -1026,6 +1030,14 @@ export function registerTools(
           ...(excludeStaffIDs?.length ? { excludeStaffIDs } : {}),
           jobsChecked: ids.length,
           jobsWithSchedules: scheduledJobIDs.length,
+          ...(truncatedSchedules.length
+            ? {
+                warning:
+                  "Some jobs have more schedule bookings than were read; their cost centres may be missing or show an " +
+                  "early lastScheduled. Re-run with jobIDs and a scheduledFrom to narrow them.",
+                truncatedSchedules,
+              }
+            : {}),
           ...report,
         });
       } catch (e) {
@@ -1040,7 +1052,7 @@ export function registerTools(
       title: "Staff Schedule",
       description:
         "One staff member's schedule over a date range: every booking (date, hours, blocks, reference) plus total " +
-        "scheduled hours. Read-only.",
+        "scheduled hours. Find a staffID with simpro_api_get path 'employees/' and query { columns: 'ID,Name' }.",
       inputSchema: {
         staffID: z.number().int().positive().describe("Employee/staff ID (Staff.ID on schedules)."),
         dateFrom: z.string().describe("Start date YYYY-MM-DD (inclusive)."),
@@ -1111,7 +1123,7 @@ export function registerTools(
     {
       title: "Find Simpro Operation",
       description:
-        "Search the full Simpro REST API (~1,300 endpoints; documented at https://developer.simprogroup.com/apidoc/) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote (for line items use manage_line_items). Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods. " +
+        "Search the full Simpro REST API (~1,300 endpoints) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote (for line items use manage_line_items). Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods. " +
         "Pre-builds come in two kinds with separate routes, set price (prebuilds/setPrice/{id}) and standard price (prebuilds/standardPrice/{id}); each ID answers on only one. The generic prebuilds/ list shows which via its `_href` column (request columns 'ID,Name,_href').",
       inputSchema: {
         query: z.string().describe("What you want to do, in keywords, e.g. 'list customer contacts' or 'update a quote'."),
@@ -1191,7 +1203,7 @@ export function registerTools(
     {
       title: "Simpro API GET",
       description:
-        "Read from any Simpro REST API GET endpoint (paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Covers reads in areas without a dedicated tool. " +
+        "Read from any Simpro REST API GET endpoint (paths from find_operation). {companyID} is auto-filled; other {placeholders} take real IDs. Covers reads in areas without a dedicated tool. " +
         "Free-text filtering on a Simpro list is NOT done via the `search` param — that param only takes 'all'/'any' (a match scheme); passing words 422s. To match free text, use a wildcard column filter: query: { Name: '%court%' }. " +
         "For convenience pass `keywords` + `keywordColumns` and this wraps each column in %…% for you (e.g. keywords:'court', keywordColumns:['Name'] → Name='%court%'). You must name the column(s) — the right one varies by resource (Name, CompanyName, GivenName/FamilyName, PartNo, Description, …); inspect a row or find_operation params if unsure. Not every column is filterable. " +
         "Use simpro_api_post / simpro_api_put / simpro_api_delete for writes.",
@@ -1225,13 +1237,12 @@ export function registerTools(
     {
       title: "Query Collection (multi-record field select)",
       description:
-        "Fetch many records from any Simpro list (GET-multiple) endpoint and return ONLY the dot-path fields you ask for — across nested levels. Built for cross-record rollups (e.g. cost-centre $ totals over many jobs) without dumping whole records to the model. " +
-        "Each `field` is the full path from the record root, e.g. 'ID', 'Total.ExTax', 'Sections.CostCenters.Total.ExTax'. " +
-        "Simpro can only select TOP-LEVEL columns, so this requests those (with display=all to expand them) and narrows to your exact sub-paths itself. " +
-        "When fields cross an array (e.g. Sections→CostCenters), the record FANS OUT to one row per leaf-most element, with the record-level fields repeated on each row. Rows are returned NESTED (the path is rebuilt into a tree), so a shared prefix like Sections.CostCenters is stated once per row, not on every key; a job 'ID' at the root and a cost-centre 'ID' under Sections.CostCenters sit at different depths and never collide. Each array level the fields descend through also carries its own 'ID' automatically (where the elements have one), so every fanned-out level is identifiable. " +
-        "A field that NAMES an array directly (e.g. 'Blocks') returns that whole array as the value — no fan-out; only naming a sub-path INTO it (e.g. 'Blocks.Hrs') fans out one row per element. " +
-        "Returns one page as { collection, rows, pagination }; `collection` echoes the queried path so you know what the root 'ID' on each row identifies (e.g. collection 'jobs' → the root 'ID' is the job's). Request later pages with `page`. " +
-        "Note: display=all expands sell-side values (Total/SellPrice/Claimed) at every level, but the cost/margin `Totals` object is NOT expandable into nested arrays — it exists only at the record top level (job 'Totals') and on the cost-centre resource itself. For per-cost-centre cost/margin you must read each cost centre directly.",
+        "Fetch many records from any Simpro list endpoint and return only the dot-path fields you ask for, across nested levels — for cross-record rollups (e.g. cost-centre totals over many jobs). " +
+        "Fields are full paths from the record root, e.g. 'Total.ExTax' or 'Sections.CostCenters.Total.ExTax'. " +
+        "A path into an array fans the record out to one row per leaf-most element; rows come back nested, with record-level fields repeated and each array level carrying its own ID. " +
+        "Naming an array itself (e.g. 'Blocks') returns the whole array as one value without fanning out. " +
+        "Returns one page as { collection, rows, pagination }. " +
+        "The cost/margin `Totals` object exists only at the record top level, not inside Sections/CostCenters; for per-cost-centre cost or margin, read each cost centre directly.",
       inputSchema: {
         path: z
           .string()
@@ -1280,9 +1291,9 @@ export function registerTools(
     {
       title: "Describe Collection Fields",
       description:
-        "Discover the selectable dot-path fields for query_collection on a given collection. Fetches one live record (display=all) and returns its full queryable model: every field as a full dot-path from the record root (e.g. 'Sections.CostCenters.Total.ExTax'), its type, and an `array: true` flag where a path passes THROUGH an array (so selecting a sub-path fans out one row per element). An array node itself (e.g. 'Blocks', type:'array') can be selected directly to get the whole array as one value; selecting a sub-path into it (e.g. 'Blocks.Hrs') is what fans out. Call this first when you don't know a collection's field paths, then pass the ones you want to query_collection. " +
-        "Example values are OMITTED by default to stay lean — pass values:true to include a sample value per leaf. The jobs/ model is large (~260 paths); scope it with `only` (e.g. ['Sections','Totals']) to the subtrees you care about. " +
-        "Reflects the live data shape, not a static spec — fields absent from a sample record (empty arrays, null objects) won't appear.",
+        "List the dot-path fields query_collection can select on a collection, read from one live sample record: each path, its type, and `array: true` where the path passes through an array (selecting below it fans out). " +
+        "The jobs/ model is large (~260 paths); scope it with `only` (e.g. ['Sections','Totals']). " +
+        "Fields empty in the sample record won't appear; use `filters` to sample a fuller record.",
       inputSchema: {
         path: z
           .string()
@@ -1347,7 +1358,7 @@ export function registerTools(
     {
       title: "Simpro API POST / PATCH (write)",
       description:
-        "Create or partially update via the Simpro REST API (POST and PATCH; paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Mutates real data in the connected Simpro account. The result carries `resourceId` — the id Simpro assigned/updated — so a retry that lost the response can confirm-by-id instead of re-creating. Use simpro_api_put to replace, simpro_api_delete to remove, simpro_api_get to read.",
+        "Create or partially update via the Simpro REST API (POST and PATCH; paths from find_operation). {companyID} is auto-filled; other {placeholders} take real IDs. Mutates real data in the connected Simpro account. The result carries `resourceId` — the id Simpro assigned/updated — so a retry that lost the response can confirm-by-id instead of re-creating. Use simpro_api_put to replace, simpro_api_delete to remove, simpro_api_get to read.",
       inputSchema: {
         method: z.enum(["POST", "PATCH"]).optional().describe("POST (create) or PATCH (partial update). Defaults to POST."),
         path: writePath,
@@ -1370,7 +1381,7 @@ export function registerTools(
     {
       title: "Simpro API PUT (write)",
       description:
-        "Replace a record via the Simpro REST API (PUT; paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Mutates real data in the connected Simpro account. Use simpro_api_post for create / partial update, simpro_api_delete to remove, simpro_api_get to read.",
+        "Replace a record via the Simpro REST API (PUT; paths from find_operation). {companyID} is auto-filled; other {placeholders} take real IDs. Mutates real data in the connected Simpro account. Use simpro_api_post for create / partial update, simpro_api_delete to remove, simpro_api_get to read.",
       inputSchema: {
         path: writePath,
         query: z.record(z.unknown()).optional().describe("Query-string params."),
@@ -1392,7 +1403,7 @@ export function registerTools(
     {
       title: "Simpro API DELETE (write)",
       description:
-        "Delete a record via the Simpro REST API (DELETE; paths from find_operation; full reference at https://developer.simprogroup.com/apidoc/). {companyID} is auto-filled; other {placeholders} take real IDs. Permanently removes real data from the connected Simpro account. Use simpro_api_get to read, simpro_api_post / simpro_api_put to write.",
+        "Delete a record via the Simpro REST API (DELETE; paths from find_operation). {companyID} is auto-filled; other {placeholders} take real IDs. Permanently removes real data from the connected Simpro account. Use simpro_api_get to read, simpro_api_post / simpro_api_put to write.",
       inputSchema: {
         path: writePath,
         query: z.record(z.unknown()).optional().describe("Query-string params."),

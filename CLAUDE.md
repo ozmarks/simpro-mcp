@@ -164,6 +164,7 @@ These are non-obvious and were verified live; the code comments hold the full de
   `Claimed` block; treat it as 0% claimed. `invoices/` accepts `Jobs.ID=in(...)`.
 - **Invoice sends are only visible in the log.** `logs/customerInvoices/` gets an `Emailed <recipients> Invoice no. N`
   line per send; `Message` takes a case-insensitive `%wildcard%` filter and combines with `CustomerInvoiceID=in(...)`.
+  The `Sent to Client` status is no evidence of a send: Simpro sets it automatically when the invoice is viewed.
 - **`oneOff` sell price**: write `SellPriceExDiscount` (number) or
   `EstimatedCost`+`Markup`; never POST `SellPrice: { ExTax }` (that's the read shape →
   422). See `ITEM_TYPES.oneOff.createHint`.

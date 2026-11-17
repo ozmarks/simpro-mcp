@@ -267,7 +267,12 @@ export class SimproClient {
   async getAllPages(
     path: string,
     query: Record<string, unknown> = {},
-    opts: { pageSize?: number; maxPages?: number; bearer?: string } = {},
+    opts: {
+      pageSize?: number;
+      maxPages?: number;
+      bearer?: string;
+      onTruncated?: (info: { fetchedPages: number; totalPages: number }) => void;
+    } = {},
   ): Promise<unknown[]> {
     const pageSize = opts.pageSize ?? 250;
     const maxPages = opts.maxPages ?? 20;
@@ -278,6 +283,7 @@ export class SimproClient {
     const rows: unknown[] = Array.isArray(first.body) ? [...first.body] : [];
     const totalPages = Number(first.headers.get("Result-Pages")) || 1;
     const pages = Math.min(totalPages, maxPages);
+    if (totalPages > maxPages) opts.onTruncated?.({ fetchedPages: maxPages, totalPages });
     for (let p = 2; p <= pages; p++) {
       const next = await this.request("GET", path, {
         query: { ...query, pageSize, page: p },

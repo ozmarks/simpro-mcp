@@ -34,9 +34,9 @@ export const ITEM_TYPES: Record<ItemType, ItemTypeDef> = {
     segment: "oneOffs",
     anchorField: "Type",
     createHint:
-      "fields.Type ('Material'|'Labor') + fields.Description + fields.Total ({ Qty }); " +
-      "set the sell with fields.SellPriceExDiscount (number) for an exact price, " +
-      "or fields.EstimatedCost + fields.Markup. Do not POST SellPrice as { ExTax } (read-only shape).",
+      "fields.Type ('Material'|'Labor') + fields.Description + fields.Total ({ Qty }), with the sell as " +
+      "fields.SellPriceExDiscount (number) for an exact price or fields.EstimatedCost + fields.Markup, " +
+      "never SellPrice: { ExTax } (read-only shape)",
     canUpdate: true,
     canDelete: true,
   },
