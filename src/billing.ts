@@ -198,28 +198,78 @@ export type JobCostCenterRow = {
   Sections?: { ID?: number; CostCenters?: AnyRec };
 };
 
-// Combine the three reads into the report: one entry per job that has at least one cost centre
-// scheduled at or before the cutoff with unclaimed value left.
+export type UninvoicedCheck = "scheduled" | "markedComplete";
+export const UNINVOICED_CHECKS: UninvoicedCheck[] = ["scheduled", "markedComplete"];
+
+// Job-log text Simpro writes when someone changes a cost centre's stage.
+export const STAGE_LOG_FILTER = "%Updated Stage from%for Cost Centre%";
+const STAGE_LOG = /^Updated Stage from "([^"]*)" to "([^"]*)" for Cost Centre .* \(#(\d+)-(\d+)\)$/s;
+
+export type StageChange = { jobID: number; costCenterID: number; from: string; to: string };
+
+export function parseStageLog(message: string | undefined): StageChange | undefined {
+  const m = STAGE_LOG.exec(String(message ?? ""));
+  return m ? { jobID: Number(m[3]), costCenterID: Number(m[4]), from: m[1], to: m[2] } : undefined;
+}
+
+export type MarkedComplete = { on: string; by?: string };
+
+// Cost centres whose latest logged stage change is to Complete. Stages can be moved back, so an
+// older "to Complete" is ignored once a later change exists.
+export function markedCompleteFromLogs(logs: AnyRec[]): Map<number, MarkedComplete> {
+  const latest = new Map<number, { to: string; at: number; id: number; on: string; by?: string }>();
+  for (const l of logs) {
+    const change = parseStageLog(l.Message);
+    if (!change) continue;
+    const at = Date.parse(String(l.DateLogged ?? ""));
+    if (!Number.isFinite(at)) continue;
+    const id = Number(l.ID) || 0;
+    const cur = latest.get(change.costCenterID);
+    if (cur && (at < cur.at || (at === cur.at && id < cur.id))) continue;
+    latest.set(change.costCenterID, { to: change.to, at, id, on: String(l.DateLogged).slice(0, 10), by: l.Staff?.Name });
+  }
+  const out = new Map<number, MarkedComplete>();
+  for (const [ccID, v] of latest) if (v.to.toLowerCase() === "complete") out.set(ccID, { on: v.on, ...(v.by ? { by: v.by } : {}) });
+  return out;
+}
+
+// Combine the reads into the report: one entry per job with at least one cost centre that has
+// unclaimed value and matches a check (scheduled on/before the cutoff, or marked complete).
 export function buildUninvoicedReport(
   jobRows: JobCostCenterRow[],
   schedulesByJob: Map<number, ScheduleRow[]>,
   invoices: AnyRec[],
-  opts: { cutoff: string; from?: string; excludeStaffIDs?: number[]; asOf: string; minUnclaimed?: number },
+  opts: {
+    cutoff: string;
+    from?: string;
+    excludeStaffIDs?: number[];
+    asOf: string;
+    minUnclaimed?: number;
+    checks?: UninvoicedCheck[];
+    markedComplete?: Map<number, MarkedComplete>;
+  },
 ): { summary: Record<string, unknown>; jobs: AnyRec[] } {
   const minUnclaimed = opts.minUnclaimed ?? 0.01;
+  const checks = new Set(opts.checks ?? UNINVOICED_CHECKS);
   const lastInv = lastInvoicePerCostCenter(invoices);
   const perJobSched = new Map<number, Map<number, CcSched>>();
-  for (const [jobID, rows] of schedulesByJob) perJobSched.set(jobID, summarizeSchedules(rows, opts));
+  if (checks.has("scheduled")) for (const [jobID, rows] of schedulesByJob) perJobSched.set(jobID, summarizeSchedules(rows, opts));
 
   const jobs = new Map<number, AnyRec>();
+  const byFlag: Record<UninvoicedCheck, number> = { scheduled: 0, markedComplete: 0 };
   for (const row of jobRows) {
     const cc = row.Sections?.CostCenters;
     const ccID = Number(cc?.ID);
     if (!cc || !Number.isFinite(ccID)) continue;
     const sched = perJobSched.get(row.ID)?.get(ccID);
-    if (!sched) continue;
+    const done = checks.has("markedComplete") ? opts.markedComplete?.get(ccID) : undefined;
+    if (!sched && !done) continue;
     const u = unclaimed(cc);
     if (u.remaining < minUnclaimed) continue;
+    const flags: UninvoicedCheck[] = [];
+    if (sched) flags.push("scheduled");
+    if (done) flags.push("markedComplete");
+    for (const f of flags) byFlag[f] += 1;
     const inv = lastInv.get(ccID);
     let job = jobs.get(row.ID);
     if (!job) {
@@ -230,38 +280,50 @@ export function buildUninvoicedReport(
         customer: customerName(row.Customer),
         customerID: row.Customer?.ID,
         unclaimedExTax: 0,
-        lastScheduled: sched.lastScheduled,
         costCenters: [] as AnyRec[],
       };
       jobs.set(row.ID, job);
     }
     job.unclaimedExTax = round2(job.unclaimedExTax + u.remaining);
-    if (sched.lastScheduled > job.lastScheduled) job.lastScheduled = sched.lastScheduled;
+    if (sched && !(job.lastScheduled >= sched.lastScheduled)) job.lastScheduled = sched.lastScheduled;
     job.costCenters.push({
       costCenterID: ccID,
       sectionID: row.Sections?.ID,
       name: cc.Name,
+      flags,
       totalExTax: u.total,
       claimedPercent: u.claimedPercent,
       unclaimedExTax: u.remaining,
-      firstScheduled: sched.firstScheduled,
-      lastScheduled: sched.lastScheduled,
-      bookings: sched.bookings,
-      scheduledHours: sched.hours,
+      ...(done ? { markedCompleteOn: done.on, ...(done.by ? { markedCompleteBy: done.by } : {}) } : {}),
+      ...(sched
+        ? {
+            firstScheduled: sched.firstScheduled,
+            lastScheduled: sched.lastScheduled,
+            bookings: sched.bookings,
+            scheduledHours: sched.hours,
+          }
+        : {}),
       lastInvoiced: inv?.date,
       lastInvoiceID: inv?.invoiceID,
-      invoicedSinceLastSchedule: inv ? inv.date >= sched.lastScheduled : false,
+      ...(sched ? { invoicedSinceLastSchedule: inv ? inv.date >= sched.lastScheduled : false } : {}),
+      ...(done ? { invoicedSinceMarkedComplete: inv ? inv.date >= done.on : false } : {}),
     });
   }
 
-  const list: AnyRec[] = [...jobs.values()].map((j) => ({ ...j, daysSinceLastScheduled: daysBetween(opts.asOf, j.lastScheduled) }));
-  list.sort((a, b) => String(a.lastScheduled).localeCompare(String(b.lastScheduled)));
+  // Oldest evidence first: last scheduled date, else the earliest marked-complete date.
+  const sortKey = (j: AnyRec): string =>
+    j.lastScheduled ?? j.costCenters.map((c: AnyRec) => c.markedCompleteOn).filter(Boolean).sort()[0] ?? "";
+  const list: AnyRec[] = [...jobs.values()].map((j) =>
+    j.lastScheduled ? { ...j, daysSinceLastScheduled: daysBetween(opts.asOf, j.lastScheduled) } : j,
+  );
+  list.sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
   const totalUnclaimed = round2(list.reduce((s, j) => s + j.unclaimedExTax, 0));
   return {
     summary: {
       jobs: list.length,
       costCenters: list.reduce((s, j) => s + j.costCenters.length, 0),
       unclaimedExTax: totalUnclaimed,
+      byFlag: Object.fromEntries([...checks].map((c) => [c, byFlag[c]])),
     },
     jobs: list,
   };

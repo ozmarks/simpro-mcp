@@ -12,6 +12,8 @@ import {
   unclaimed,
   shapeUnsentInvoices,
   buildUninvoicedReport,
+  parseStageLog,
+  markedCompleteFromLogs,
 } from "../src/billing.js";
 
 test("chunk splits into fixed-size batches", () => {
@@ -133,7 +135,7 @@ test("buildUninvoicedReport lists scheduled cost centres with unclaimed value", 
   ]);
   const invoices = [{ ID: 900, DateIssued: "2026-10-01", CostCenters: [{ ID: 10 }] }];
   const r = buildUninvoicedReport(jobRows, schedules, invoices, { cutoff: "2026-10-30", asOf: "2026-11-10" });
-  assert.deepEqual(r.summary, { jobs: 1, costCenters: 1, unclaimedExTax: 1000 });
+  assert.deepEqual(r.summary, { jobs: 1, costCenters: 1, unclaimedExTax: 1000, byFlag: { scheduled: 1, markedComplete: 0 } });
   const [job] = r.jobs;
   assert.equal(job.jobID, 1);
   assert.equal(job.customer, "C");
@@ -141,4 +143,60 @@ test("buildUninvoicedReport lists scheduled cost centres with unclaimed value", 
   assert.equal(job.costCenters[0].costCenterID, 10);
   assert.equal(job.costCenters[0].lastInvoiced, "2026-10-01");
   assert.equal(job.costCenters[0].invoicedSinceLastSchedule, false);
+});
+
+test("parseStageLog reads cost-centre stage changes and ignores job-level ones", () => {
+  assert.deepEqual(
+    parseStageLog('Updated Stage from "Pending" to "Complete" for Cost Centre Paint (#1001-2001)'),
+    { jobID: 1001, costCenterID: 2001, from: "Pending", to: "Complete" },
+  );
+  assert.deepEqual(
+    parseStageLog('Updated Stage from "Complete" to "In Progress" for Cost Centre 7) Main St (North) (#1001-2002)'),
+    { jobID: 1001, costCenterID: 2002, from: "Complete", to: "In Progress" },
+  );
+  assert.equal(parseStageLog('Updated Stage from "pending" to "progress"'), undefined);
+  assert.equal(parseStageLog('Updated Progress from "0%" to "100%" for Cost Centre Paint (#1001-2001)'), undefined);
+});
+
+test("markedCompleteFromLogs keeps cost centres whose latest stage change is to Complete", () => {
+  const msg = (from: string, to: string, cc: number) => `Updated Stage from "${from}" to "${to}" for Cost Centre X (#1-${cc})`;
+  const m = markedCompleteFromLogs([
+    { ID: 1, Message: msg("Pending", "Complete", 10), DateLogged: "2026-10-01T09:00:00+10:00", Staff: { Name: "A" } },
+    { ID: 2, Message: msg("Pending", "Complete", 11), DateLogged: "2026-10-01T09:00:00+10:00" },
+    { ID: 3, Message: msg("Complete", "In Progress", 11), DateLogged: "2026-10-02T09:00:00+10:00" },
+    { ID: 4, Message: msg("In Progress", "Complete", 12), DateLogged: "2026-10-05T09:00:00+10:00", Staff: { Name: "B" } },
+    { ID: 5, Message: msg("Pending", "In Progress", 12), DateLogged: "2026-10-03T09:00:00+10:00" },
+  ]);
+  assert.deepEqual([...m.keys()].sort(), [10, 12]);
+  assert.deepEqual(m.get(10), { on: "2026-10-01", by: "A" });
+  assert.deepEqual(m.get(12), { on: "2026-10-05", by: "B" });
+});
+
+test("buildUninvoicedReport flags marked-complete cost centres without schedules, and respects checks", () => {
+  const jobRows = [
+    { ID: 1, Name: "J1", Sections: { ID: 100, CostCenters: { ID: 10, Name: "A", Total: { ExTax: 1000 } } } },
+    { ID: 1, Name: "J1", Sections: { ID: 100, CostCenters: { ID: 11, Name: "B", Total: { ExTax: 400 } } } },
+  ];
+  const schedules = new Map([[1, [{ Date: "2026-10-20", Reference: "1-11", TotalHours: 2 }]]]);
+  const markedComplete = new Map([[10, { on: "2026-10-15", by: "A" }], [11, { on: "2026-10-21" }]]);
+  const invoices = [{ ID: 900, DateIssued: "2026-10-16", CostCenters: [{ ID: 10 }] }];
+  const opts = { cutoff: "2026-10-30", asOf: "2026-11-10", markedComplete };
+
+  const both = buildUninvoicedReport(jobRows, schedules, invoices, opts);
+  assert.deepEqual(both.summary.byFlag, { scheduled: 1, markedComplete: 2 });
+  const [a, b] = both.jobs[0].costCenters;
+  assert.deepEqual(a.flags, ["markedComplete"]);
+  assert.equal(a.markedCompleteBy, "A");
+  assert.equal(a.invoicedSinceMarkedComplete, true);
+  assert.equal(a.lastScheduled, undefined);
+  assert.deepEqual(b.flags, ["scheduled", "markedComplete"]);
+  assert.equal(both.jobs[0].lastScheduled, "2026-10-20");
+
+  const onlySched = buildUninvoicedReport(jobRows, schedules, invoices, { ...opts, checks: ["scheduled"] });
+  assert.deepEqual(onlySched.jobs[0].costCenters.map((c: any) => c.costCenterID), [11]);
+  assert.deepEqual(onlySched.summary.byFlag, { scheduled: 1 });
+
+  const onlyDone = buildUninvoicedReport(jobRows, new Map(), invoices, { ...opts, checks: ["markedComplete"] });
+  assert.equal(onlyDone.jobs[0].daysSinceLastScheduled, undefined);
+  assert.equal(onlyDone.summary.costCenters, 2);
 });

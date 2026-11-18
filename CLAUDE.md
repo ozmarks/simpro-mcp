@@ -157,9 +157,15 @@ These are non-obvious and were verified live; the code comments hold the full de
   create with `Customers: [id]`. `customers/{id}/sites/` doesn't exist.
 - **Quote/job `Description` is rich text (HTML)**; plain-text line breaks collapse. Cost centre
   `Notes` are plain text.
-- **Schedules can't be filtered by job directly.** `Project.ProjectID` 422s ("does not allow search requests
-  on its child objects") and `Reference=in(...)` 422s ("cannot contain more than 1 '-'"). `Reference=<jobID>`
-  (a bare job ID) matches every `<jobID>-<costCenterID>` booking for that job, so it's one call per job.
+- **Filter schedules by job with `JobID`, not `Reference`.** `schedules/` takes `JobID=in(...)` (and the usual
+  operators) though it's missing from the API index, so many jobs' bookings come back in one paged query.
+  `Reference=in(<jobIDs>)` returns **0 rows with no error**, `Reference=in(<a-b>,…)` 422s ("cannot contain more
+  than 1 '-'"), and `Project.ID` 422s ("does not allow search requests on its child objects").
+- **Cost-centre stage is only readable in bulk from the job log.** `jobCostCenters/` has no stage (a `Stage` filter
+  is silently ignored), the `jobs/` `display=all` embed omits it, and `Sections.CostCenters.Stage` 422s. `logs/jobs/`
+  takes `JobID=in(...)` + a `Message` wildcard and records `Updated Stage from "X" to "Y" for Cost Centre … (#job-cc)`
+  with `Staff` and `DateLogged`; take the latest change per cost centre. Simpro sets Complete **without** a log line
+  when a cost centre is fully claimed, and on some variations, so the log reflects manual marks only.
 - **Unclaimed cost centres omit `Claimed`.** On `jobs/` with `display=all`, a cost centre never invoiced has no
   `Claimed` block; treat it as 0% claimed. `invoices/` accepts `Jobs.ID=in(...)`.
 - **Invoice sends are only visible in the log.** `logs/customerInvoices/` gets an `Emailed <recipients> Invoice no. N`

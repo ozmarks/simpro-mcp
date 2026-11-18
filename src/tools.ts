@@ -22,9 +22,15 @@ import {
   isIsoDate,
   localToday,
   resolveCutoff,
+  parseReference,
   wildcard,
   shapeUnsentInvoices,
   buildUninvoicedReport,
+  markedCompleteFromLogs,
+  STAGE_LOG_FILTER,
+  UNINVOICED_CHECKS,
+  type MarkedComplete,
+  type UninvoicedCheck,
   type ScheduleRow,
   type JobCostCenterRow,
 } from "./billing.js";
@@ -931,14 +937,21 @@ export function registerTools(
     {
       title: "Find Uninvoiced Work",
       description:
-        "Jobs (Stage Progress or Complete) with work scheduled on or before a cutoff date that still has unclaimed value, " +
-        "reported per cost centre. A cost centre is included when it has at least one job schedule dated <= cutoff AND " +
-        "unclaimed ex-tax value remaining. Set the cutoff with cutoffDate, or offsetDays back from today (e.g. offsetDays 11 " +
-        "on 10 Nov -> work up to 30 Oct). Each cost centre carries its last scheduled date, claimed %, unclaimed value, and " +
-        "the last invoice that included it (invoicedSinceLastSchedule shows whether an invoice was issued on/after the last " +
-        "scheduled date, e.g. a partial progress claim). excludeStaffIDs drops schedules booked to those staff/crew " +
-        "(e.g. bookings for a crew that should not count as billable work). Costs one call per job, so narrow with customerID/jobIDs on large books.",
+        "Cost centres on jobs in Progress or Complete that still have unclaimed value and match a check. `checks` picks which run (default both): " +
+        "'scheduled' — booked on or before a cutoff date; 'markedComplete' — someone set the cost centre's stage to Complete " +
+        "(read from the job log; a later change back un-marks it). Each cost centre lists the `flags` it matched. " +
+        "This flags a gap, not its cause: scheduled work may be done but not invoiced, waiting on a job card or sign-off, or booked but never carried out, " +
+        "so treat each result as something to check. A markedComplete cost centre left unclaimed is the stronger signal. " +
+        "Set the cutoff (scheduled check only) with cutoffDate, or offsetDays back from today (e.g. offsetDays 11 on 10 Nov -> work up to 30 Oct). " +
+        "Each cost centre carries claimed %, unclaimed value, the last invoice that included it, and per flag: last scheduled date and " +
+        "invoicedSinceLastSchedule, or markedCompleteOn/markedCompleteBy and invoicedSinceMarkedComplete (true means a partial claim was " +
+        "issued after that date). excludeStaffIDs drops schedules booked to those staff/crew. Covers at most 200 jobs; narrow with customerID or jobIDs on large books.",
       inputSchema: {
+        checks: z
+          .array(z.enum(UNINVOICED_CHECKS as [UninvoicedCheck, ...UninvoicedCheck[]]))
+          .min(1)
+          .optional()
+          .describe("Which checks to run: 'scheduled', 'markedComplete'. Default both."),
         cutoffDate: z.string().optional().describe("Only count work scheduled on/before this date (YYYY-MM-DD). Overrides offsetDays."),
         offsetDays: z.number().int().min(0).optional().describe("Cutoff = asOf (default today) minus this many days. Default 0."),
         asOf: z.string().optional().describe("Reference 'today' for offsetDays and daysSinceLastScheduled (YYYY-MM-DD)."),
@@ -950,7 +963,7 @@ export function registerTools(
       },
       annotations: { title: "Find Uninvoiced Work", readOnlyHint: true },
     },
-    async ({ cutoffDate, offsetDays, asOf, scheduledFrom, excludeStaffIDs, customerID, jobIDs, minUnclaimed }) => {
+    async ({ checks, cutoffDate, offsetDays, asOf, scheduledFrom, excludeStaffIDs, customerID, jobIDs, minUnclaimed }) => {
       try {
         for (const [k, v] of Object.entries({ asOf, scheduledFrom })) {
           if (v && !isIsoDate(v)) return fail(new Error(`${k} must be YYYY-MM-DD (got "${v}").`));
@@ -969,7 +982,7 @@ export function registerTools(
         if (jobCount.totalRows > MAX_UNINVOICED_JOBS) {
           return fail(
             new Error(
-              `${jobCount.totalRows} jobs are in Progress/Complete; this tool reads schedules one job at a time and caps at ` +
+              `${jobCount.totalRows} jobs are in Progress/Complete; this tool caps at ` +
                 `${MAX_UNINVOICED_JOBS}. Narrow with customerID or jobIDs.`,
             ),
           );
@@ -991,25 +1004,54 @@ export function registerTools(
           { filters: jobFilters, allPages: true },
         );
         const ids = [...new Set(jobRows.map((r) => Number(r.ID)).filter(Number.isFinite))];
+        const run = new Set(checks ?? UNINVOICED_CHECKS);
+        const truncated: Array<{ source: string; jobIDs: number[]; fetchedPages: number; totalPages: number }> = [];
 
-        // 2. Schedules per job. Simpro can't filter schedules by Project.* and rejects in() on Reference,
-        // but Reference=<jobID> matches every "<jobID>-<costCenterID>" booking for that job.
+        // 2. Schedules for all in-scope jobs. JobID takes in() but isn't in the API index; Reference
+        // silently returns nothing for in(), so don't switch to it.
         const dateFilter = scheduledFrom ? `between(${scheduledFrom},${cutoff})` : `le(${cutoff})`;
         const schedulesByJob = new Map<number, ScheduleRow[]>();
-        const truncatedSchedules: Array<{ jobID: number; fetchedPages: number; totalPages: number }> = [];
-        await mapLimit(ids, 4, async (jobID) => {
-          const rows = await client.getAllPages(
-            "schedules/",
-            { Type: "job", Reference: String(jobID), Date: dateFilter, columns: "ID,Date,Reference,Staff,TotalHours" },
-            { onTruncated: (info) => truncatedSchedules.push({ jobID, ...info }) },
-          );
-          if (rows.length) schedulesByJob.set(jobID, rows as ScheduleRow[]);
-        });
+        if (run.has("scheduled")) {
+          await mapLimit(chunk(ids, 100), 2, async (batch) => {
+            const rows = (await client.getAllPages(
+              "schedules/",
+              { Type: "job", JobID: `in(${batch.join(",")})`, Date: dateFilter, columns: "ID,Date,Reference,Staff,TotalHours" },
+              { onTruncated: (info) => truncated.push({ source: "schedules", jobIDs: batch, ...info }) },
+            )) as ScheduleRow[];
+            for (const row of rows) {
+              const jobID = parseReference(row.Reference)?.jobID;
+              if (jobID === undefined) continue;
+              const list = schedulesByJob.get(jobID);
+              if (list) list.push(row);
+              else schedulesByJob.set(jobID, [row]);
+            }
+          });
+        }
 
-        // 3. Invoices touching the scheduled jobs, one row per invoiced cost centre.
+        // 3. Cost-centre stage changes from the job log. Stage isn't readable in bulk anywhere else
+        // (jobCostCenters/ and the jobs/ embed omit it); the log also says who marked it and when.
+        let markedComplete = new Map<number, MarkedComplete>();
+        if (run.has("markedComplete")) {
+          const logs: Array<Record<string, unknown>> = [];
+          await mapLimit(chunk(ids, 100), 2, async (batch) => {
+            const rows = await client.getAllPages(
+              "logs/jobs/",
+              { JobID: `in(${batch.join(",")})`, Message: STAGE_LOG_FILTER, columns: "ID,JobID,Message,Staff,DateLogged" },
+              { onTruncated: (info) => truncated.push({ source: "jobLogs", jobIDs: batch, ...info }) },
+            );
+            logs.push(...(rows as Array<Record<string, unknown>>));
+          });
+          markedComplete = markedCompleteFromLogs(logs);
+        }
+
+        // 4. Invoices touching any job with a hit, one row per invoiced cost centre.
         const scheduledJobIDs = [...schedulesByJob.keys()];
+        const completeJobIDs = new Set(
+          (jobRows as JobCostCenterRow[]).filter((r) => markedComplete.has(Number(r.Sections?.CostCenters?.ID))).map((r) => r.ID),
+        );
+        const invoiceJobIDs = [...new Set([...scheduledJobIDs, ...completeJobIDs])];
         const invoices: Array<Record<string, unknown>> = [];
-        await mapLimit(chunk(scheduledJobIDs, 50), 2, async (batch) => {
+        await mapLimit(chunk(invoiceJobIDs, 100), 2, async (batch) => {
           const { rows } = await fetchProjected(client, "invoices/", ["ID", "DateIssued", "CostCenters.ID"], {
             filters: { "Jobs.ID": `in(${batch.join(",")})` },
             allPages: true,
@@ -1023,19 +1065,22 @@ export function registerTools(
           excludeStaffIDs,
           asOf: today,
           minUnclaimed,
+          checks: [...run],
+          markedComplete,
         });
         return ok({
-          cutoff,
+          checks: [...run],
+          ...(run.has("scheduled") ? { cutoff } : {}),
           ...(scheduledFrom ? { scheduledFrom } : {}),
           ...(excludeStaffIDs?.length ? { excludeStaffIDs } : {}),
           jobsChecked: ids.length,
-          jobsWithSchedules: scheduledJobIDs.length,
-          ...(truncatedSchedules.length
+          ...(run.has("scheduled") ? { jobsWithSchedules: scheduledJobIDs.length } : {}),
+          ...(truncated.length
             ? {
                 warning:
-                  "Some jobs have more schedule bookings than were read; their cost centres may be missing or show an " +
-                  "early lastScheduled. Re-run with jobIDs and a scheduledFrom to narrow them.",
-                truncatedSchedules,
+                  "Some reads hit the page limit, so some cost centres may be missing or show stale dates. " +
+                  "Re-run with fewer jobIDs (and a scheduledFrom for schedules) to narrow them.",
+                truncated,
               }
             : {}),
           ...report,
