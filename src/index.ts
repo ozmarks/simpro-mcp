@@ -8,7 +8,7 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { loadConfig, type Config, type BrokerConfig } from "./config.js";
 import { SimproClient } from "./simproClient.js";
-import { registerTools, formatUpdateNotice } from "./tools.js";
+import { registerTools, formatUpdateNotice, SERVER_INSTRUCTIONS } from "./tools.js";
 import { VersionChecker } from "./versionCheck.js";
 import { brokerRouter, unsealForRequest } from "./auth/broker.js";
 import { ClientCredentialsProvider } from "./auth/simproToken.js";
@@ -66,7 +66,10 @@ function transportOptions(extraHosts: string[] = [], extraOrigins: string[] = []
 }
 
 function buildServer(client: SimproClient, cfg: Config, versionChecker?: VersionChecker): McpServer {
-  const server = new McpServer({ name: "simpro-mcp-server", version: cfg.version });
+  const server = new McpServer(
+    { name: "simpro-mcp-server", version: cfg.version },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
   registerTools(server, client, cfg, versionChecker);
   return server;
 }

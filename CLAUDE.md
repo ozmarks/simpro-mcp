@@ -95,6 +95,7 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/auth/authCodeFlow.ts` | One-time browser login over a fixed-port localhost callback; returns the Simpro refresh token. |
 | `src/login.ts` | `npm run login` entry — runs the `authorization_code` browser flow and caches the token without starting the server. |
 | `src/tools.ts` | All MCP tool registrations + helpers (~990 lines; the bulk of the logic). |
+| `src/billing.ts` | Pure logic for `find_unsent_invoices` / `find_uninvoiced_work`: cutoff resolution, schedule/claim/invoice joins. |
 | `src/lineItems.ts` | The 7 cost-center item types: URL segment, required anchor field, supported verbs. |
 | `src/uploads.ts` | Chunked attachment upload: in-process `UploadStore` singleton (TTL sessions, memory cap), join + SHA-256 verify, background post with dedupe + retry. |
 | `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
@@ -156,6 +157,20 @@ These are non-obvious and were verified live; the code comments hold the full de
   create with `Customers: [id]`. `customers/{id}/sites/` doesn't exist.
 - **Quote/job `Description` is rich text (HTML)**; plain-text line breaks collapse. Cost centre
   `Notes` are plain text.
+- **Filter schedules by job with `JobID`, not `Reference`.** `schedules/` takes `JobID=in(...)` (and the usual
+  operators) though it's missing from the API index, so many jobs' bookings come back in one paged query.
+  `Reference=in(<jobIDs>)` returns **0 rows with no error**, `Reference=in(<a-b>,…)` 422s ("cannot contain more
+  than 1 '-'"), and `Project.ID` 422s ("does not allow search requests on its child objects").
+- **Cost-centre stage is only readable in bulk from the job log.** `jobCostCenters/` has no stage (a `Stage` filter
+  is silently ignored), the `jobs/` `display=all` embed omits it, and `Sections.CostCenters.Stage` 422s. `logs/jobs/`
+  takes `JobID=in(...)` + a `Message` wildcard and records `Updated Stage from "X" to "Y" for Cost Centre … (#job-cc)`
+  with `Staff` and `DateLogged`; take the latest change per cost centre. Simpro sets Complete **without** a log line
+  when a cost centre is fully claimed, and on some variations, so the log reflects manual marks only.
+- **Unclaimed cost centres omit `Claimed`.** On `jobs/` with `display=all`, a cost centre never invoiced has no
+  `Claimed` block; treat it as 0% claimed. `invoices/` accepts `Jobs.ID=in(...)`.
+- **Invoice sends are only visible in the log.** `logs/customerInvoices/` gets an `Emailed <recipients> Invoice no. N`
+  line per send; `Message` takes a case-insensitive `%wildcard%` filter and combines with `CustomerInvoiceID=in(...)`.
+  The `Sent to Client` status is no evidence of a send: Simpro sets it automatically when the invoice is viewed.
 - **`oneOff` sell price**: write `SellPriceExDiscount` (number) or
   `EstimatedCost`+`Markup`; never POST `SellPrice: { ExTax }` (that's the read shape →
   422). See `ITEM_TYPES.oneOff.createHint`.
