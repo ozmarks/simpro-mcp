@@ -53,6 +53,40 @@ export function appendUpdateNotice(result: ToolResult, update: UpdateInfo | unde
   return { content: [...result.content, { type: "text", text: formatUpdateNotice(update) }] };
 }
 
+// Deprecated argument name -> its replacement.
+export type ArgAliases = Record<string, string>;
+export type AliasUse = { alias: string; name: string };
+
+export function resolveArgAliases(
+  args: Record<string, unknown>,
+  aliases: ArgAliases,
+): { args: Record<string, unknown>; used: AliasUse[]; conflict?: string } {
+  const out: Record<string, unknown> = { ...args };
+  const used: AliasUse[] = [];
+  for (const [alias, name] of Object.entries(aliases)) {
+    if (out[alias] === undefined) continue;
+    if (out[name] !== undefined && JSON.stringify(out[name]) !== JSON.stringify(out[alias])) {
+      return { args, used, conflict: `Pass ${name} or its deprecated alias ${alias}, not both with different values.` };
+    }
+    out[name] ??= out[alias];
+    delete out[alias];
+    used.push({ alias, name });
+  }
+  return { args: out, used };
+}
+
+export function formatDeprecationNotice(used: AliasUse[]): string {
+  const list = used.map((u) => `'${u.alias}' (use '${u.name}')`).join(", ");
+  return (
+    `Deprecated argument name${used.length > 1 ? "s" : ""}: ${list}. ` +
+    `${used.length > 1 ? "These" : "This"} will be removed in a future version of simpro-mcp-server; use the new name${used.length > 1 ? "s" : ""} from now on.`
+  );
+}
+
+export function aliasArg<T extends z.ZodTypeAny>(schema: T, name: string): z.ZodOptional<T> {
+  return schema.optional().describe(`Deprecated alias of ${name}; will be removed in a future version.`) as z.ZodOptional<T>;
+}
+
 function okWithBudget(data: unknown, maxBytes = Number.POSITIVE_INFINITY, doLean = false) {
   const cleaned = doLean ? applyLean(cleanRichText(data)) : cleanRichText(data);
   const text = cleaned === undefined ? JSON.stringify({ success: true }) : JSON.stringify(cleaned);
@@ -263,6 +297,25 @@ export function registerTools(
     return appendUpdateNotice(result, update);
   };
 
+  // Wraps a handler whose tool still accepts old argument names: maps them to the new ones, enforces
+  // `required` after mapping (the schema can't, since either name may carry the value), and appends a
+  // deprecation notice when an alias was used.
+  const withAliases =
+    <R extends { content: Array<{ type: "text"; text: string }> }>(
+      aliases: ArgAliases,
+      required: string[],
+      handler: (args: any) => Promise<R>,
+    ) =>
+    async (raw: Record<string, unknown>) => {
+      const { args, used, conflict } = resolveArgAliases(raw, aliases);
+      const withNotice = <T extends { content: Array<{ type: "text"; text: string }> }>(result: T): T =>
+        used.length ? { ...result, content: [...result.content, { type: "text" as const, text: formatDeprecationNotice(used) }] } : result;
+      if (conflict) return fail(new Error(conflict));
+      const missing = required.filter((k) => args[k] === undefined);
+      if (missing.length) return withNotice(fail(new Error(`Missing required argument${missing.length > 1 ? "s" : ""}: ${missing.join(", ")}.`)));
+      return withNotice(await handler(args));
+    };
+
   const ok = (data: unknown) => withUpdateNotice(okWithBudget(data, cfg.maxResultBytes, false));
   const okLean = (data: unknown) => withUpdateNotice(okWithBudget(data, cfg.maxResultBytes, true));
 
@@ -347,26 +400,29 @@ export function registerTools(
         "Other fields (Name, Description, DueDate, …) go in `fields`. Description is rich text (HTML): plain-text line breaks are collapsed, so use <p>, <br>, <strong> and <ul><li>.",
       inputSchema: {
         entity: entityArg,
-        customer: z.number().int().positive().describe("Customer ID (required)."),
-        site: z
+        customerID: z.number().int().positive().optional().describe("Customer ID (required)."),
+        siteID: z
           .number()
           .int()
           .positive()
+          .optional()
           .describe("Site ID (required by Simpro). A customer's sites: GET sites/ filtered by { 'Customers.ID': <customerID> }."),
         type: workTypeArg,
         fields: z.record(z.unknown()).optional().describe("Additional body fields, merged in."),
+        customer: aliasArg(z.number().int().positive(), "customerID"),
+        site: aliasArg(z.number().int().positive(), "siteID"),
       },
       annotations: { title: "Create Work", readOnlyHint: false, destructiveHint: false },
     },
-    async ({ entity, customer, site, type, fields }) => {
+    withAliases({ customer: "customerID", site: "siteID" }, ["customerID", "siteID"], async ({ entity, customerID, siteID, type, fields }) => {
       try {
         return await okWrite("POST", `${base(entity)}/`, {
-          body: { Customer: customer, Site: site, Type: type, ...(fields ?? {}) },
+          body: { Customer: customerID, Site: siteID, Type: type, ...(fields ?? {}) },
         });
       } catch (e) {
         return fail(e);
       }
-    },
+    }),
   );
 
   // Only the work-level display=all read inlines the full Items tree; the costCenters collection does not (verified live).
@@ -567,21 +623,22 @@ export function registerTools(
       inputSchema: {
         entity: entityArg,
         id: z.number().int().positive().describe("Source job/quote ID to clone."),
-        intoCustomer: z.number().int().positive().optional().describe("Customer ID for the copy (defaults to the source's customer)."),
+        intoCustomerID: z.number().int().positive().optional().describe("Customer ID for the copy (defaults to the source's customer)."),
         name: z.string().optional().describe("Name for the copy (defaults to source name + ' (copy)')."),
+        intoCustomer: aliasArg(z.number().int().positive(), "intoCustomerID"),
       },
       annotations: { title: "Duplicate Work", readOnlyHint: false, destructiveHint: false },
     },
-    async ({ entity, id, intoCustomer, name }) => {
+    withAliases({ intoCustomer: "intoCustomerID" }, [], async ({ entity, id, intoCustomerID, name }) => {
       try {
         const b = base(entity);
         const src = (await client.get(`${b}/${id}`, { display: "all" })) as Record<string, any>;
-        const body = buildDuplicateBody(entity, src, { intoCustomer, name });
+        const body = buildDuplicateBody(entity, src, { intoCustomer: intoCustomerID, name });
         return await okWrite("POST", `${b}/`, { body });
       } catch (e) {
         return fail(e);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -613,7 +670,8 @@ export function registerTools(
           if (e instanceof SimproError && e.status === 404) throw new UploadError(`${entity} ${id} does not exist in Simpro.`);
           throw e;
         }
-        return ok(uploads.start({ entity, id, filename, size, sha256, chunks }));
+        const { uploadId, ...started } = uploads.start({ entity, id, filename, size, sha256, chunks });
+        return ok({ uploadID: uploadId, ...started });
       } catch (e) {
         return fail(e);
       }
@@ -628,19 +686,20 @@ export function registerTools(
         "Send one piece of a file started with start_attachment_upload. Indexes are 0-based, may arrive in any order or in parallel, and resending an index overwrites it. " +
         "Returns how many of the chunks have arrived.",
       inputSchema: {
-        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+        uploadID: z.string().min(1).optional().describe("uploadID from start_attachment_upload (required)."),
         index: z.number().int().min(0).describe("0-based chunk index."),
         data: z.string().min(1).describe(`Base64 of this chunk's raw bytes (at most ${CHUNK_MAX_BYTES} bytes decoded).`),
+        uploadId: aliasArg(z.string().min(1), "uploadID"),
       },
       annotations: { title: "Upload Attachment Chunk", readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    async ({ uploadId, index, data }) => {
+    withAliases({ uploadId: "uploadID" }, ["uploadID"], async ({ uploadID, index, data }) => {
       try {
-        return ok(uploads.putChunk(uploadId, index, data));
+        return ok(uploads.putChunk(uploadID, index, data));
       } catch (e) {
         return fail(e);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -651,17 +710,18 @@ export function registerTools(
         "Join and verify (size, SHA-256) all chunks of an upload, then attach the file to the quote/job in the background. " +
         "Returns status 'working' (poll attachment_upload_status), or 'failed' with nothing posted if verification fails. Refused while chunks are missing (names them). Safe to call again — never attaches twice.",
       inputSchema: {
-        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+        uploadID: z.string().min(1).optional().describe("uploadID from start_attachment_upload (required)."),
+        uploadId: aliasArg(z.string().min(1), "uploadID"),
       },
       annotations: { title: "Finish Attachment Upload", readOnlyHint: false, destructiveHint: false },
     },
-    async ({ uploadId }) => {
+    withAliases({ uploadId: "uploadID" }, ["uploadID"], async ({ uploadID }) => {
       try {
-        return ok(uploads.finish(uploadId, client));
+        return ok(uploads.finish(uploadID, client));
       } catch (e) {
         return fail(e);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -671,17 +731,18 @@ export function registerTools(
       description:
         "Status of a chunked attachment upload: collecting (with chunks received), working, done (with Simpro's string attachmentId), or failed (with the reason).",
       inputSchema: {
-        uploadId: z.string().min(1).describe("uploadId from start_attachment_upload."),
+        uploadID: z.string().min(1).optional().describe("uploadID from start_attachment_upload (required)."),
+        uploadId: aliasArg(z.string().min(1), "uploadID"),
       },
       annotations: { title: "Attachment Upload Status", readOnlyHint: true },
     },
-    async ({ uploadId }) => {
+    withAliases({ uploadId: "uploadID" }, ["uploadID"], async ({ uploadID }) => {
       try {
-        return ok(uploads.status(uploadId));
+        return ok(uploads.status(uploadID));
       } catch (e) {
         return fail(e);
       }
-    },
+    }),
   );
 
   server.registerTool(
@@ -942,7 +1003,7 @@ export function registerTools(
         "(read from the job log; a later change back un-marks it). Each cost centre lists the `flags` it matched. " +
         "This flags a gap, not its cause: scheduled work may be done but not invoiced, waiting on a job card or sign-off, or booked but never carried out, " +
         "so treat each result as something to check. A markedComplete cost centre left unclaimed is the stronger signal. " +
-        "Set the cutoff (scheduled check only) with cutoffDate, or offsetDays back from today (e.g. offsetDays 11 on 10 Nov -> work up to 30 Oct). " +
+        "Set the cutoff (scheduled check only) with scheduledTo, or offsetDays back from today (e.g. offsetDays 11 on 10 Nov -> work up to 30 Oct). " +
         "Each cost centre carries claimed %, unclaimed value, the last invoice that included it, and per flag: last scheduled date and " +
         "invoicedSinceLastSchedule, or markedCompleteOn/markedCompleteBy and invoicedSinceMarkedComplete (true means a partial claim was " +
         "issued after that date). excludeStaffIDs drops schedules booked to those staff/crew. Covers at most 200 jobs; narrow with customerID or jobIDs on large books.",
@@ -952,8 +1013,8 @@ export function registerTools(
           .min(1)
           .optional()
           .describe("Which checks to run: 'scheduled', 'markedComplete'. Default both."),
-        cutoffDate: z.string().optional().describe("Only count work scheduled on/before this date (YYYY-MM-DD). Overrides offsetDays."),
-        offsetDays: z.number().int().min(0).optional().describe("Cutoff = asOf (default today) minus this many days. Default 0."),
+        scheduledTo: z.string().optional().describe("Scheduled check: only count work booked on/before this date (YYYY-MM-DD). Overrides offsetDays."),
+        offsetDays: z.number().int().min(0).optional().describe("Scheduled check: scheduledTo = asOf (default today) minus this many days. Default 0."),
         asOf: z.string().optional().describe("Reference 'today' for offsetDays and daysSinceLastScheduled (YYYY-MM-DD)."),
         scheduledFrom: z.string().optional().describe("Ignore schedules before this date (YYYY-MM-DD). Default: no lower bound."),
         excludeStaffIDs: z.array(z.number().int().positive()).optional().describe("Staff/crew IDs whose schedules are ignored (Staff.ID on schedules)."),
@@ -963,15 +1024,15 @@ export function registerTools(
       },
       annotations: { title: "Find Uninvoiced Work", readOnlyHint: true },
     },
-    async ({ checks, cutoffDate, offsetDays, asOf, scheduledFrom, excludeStaffIDs, customerID, jobIDs, minUnclaimed }) => {
+    async ({ checks, scheduledTo, offsetDays, asOf, scheduledFrom, excludeStaffIDs, customerID, jobIDs, minUnclaimed }) => {
       try {
-        for (const [k, v] of Object.entries({ asOf, scheduledFrom })) {
+        for (const [k, v] of Object.entries({ scheduledTo, asOf, scheduledFrom })) {
           if (v && !isIsoDate(v)) return fail(new Error(`${k} must be YYYY-MM-DD (got "${v}").`));
         }
         const today = asOf ?? localToday();
-        const cutoff = resolveCutoff({ cutoffDate, offsetDays, asOf: today });
+        const cutoff = resolveCutoff({ cutoffDate: scheduledTo, offsetDays, asOf: today });
         if (scheduledFrom && scheduledFrom > cutoff) {
-          return fail(new Error(`scheduledFrom (${scheduledFrom}) is after the cutoff (${cutoff}).`));
+          return fail(new Error(`scheduledFrom (${scheduledFrom}) is after scheduledTo (${cutoff}).`));
         }
 
         // 1. In-scope jobs, fanned out to one row per cost centre with its sell total and claim state.
@@ -1070,7 +1131,7 @@ export function registerTools(
         });
         return ok({
           checks: [...run],
-          ...(run.has("scheduled") ? { cutoff } : {}),
+          ...(run.has("scheduled") ? { scheduledTo: cutoff } : {}),
           ...(scheduledFrom ? { scheduledFrom } : {}),
           ...(excludeStaffIDs?.length ? { excludeStaffIDs } : {}),
           jobsChecked: ids.length,
@@ -1171,18 +1232,19 @@ export function registerTools(
         "Search the full Simpro REST API (~1,300 endpoints) by intent to find the right operation when no dedicated tool fits — e.g. customers, invoices, catalogues, inventory, contacts, notes, attachments, updating/deleting a job/quote (for line items use manage_line_items). Returns matching endpoints with method, path, and parameters; the top results also carry a schema preview (writes: required body fields; GET: available columns). For the full body schema or full column list of any endpoint, call describe_operation. simpro_api_get runs GET endpoints; simpro_api_post / simpro_api_put / simpro_api_delete run the matching write methods. " +
         "Pre-builds come in two kinds with separate routes, set price (prebuilds/setPrice/{id}) and standard price (prebuilds/standardPrice/{id}); each ID answers on only one. The generic prebuilds/ list shows which via its `_href` column (request columns 'ID,Name,_href').",
       inputSchema: {
-        query: z.string().describe("What you want to do, in keywords, e.g. 'list customer contacts' or 'update a quote'."),
+        intent: z.string().optional().describe("What you want to do, in keywords, e.g. 'list customer contacts' or 'update a quote' (required)."),
         method: z
           .enum(["GET", "POST", "PATCH", "PUT", "DELETE"])
           .optional()
           .describe("Optional: restrict to one HTTP method."),
         limit: z.number().int().positive().max(40).optional().describe("Max results (default 10)."),
+        query: aliasArg(z.string(), "intent"),
       },
       annotations: { title: "Find Simpro Operation", readOnlyHint: true, openWorldHint: true },
     },
-    async ({ query, method, limit }) => {
+    withAliases({ query: "intent" }, ["intent"], async ({ intent, method, limit }) => {
       try {
-        const found = searchEndpoints(query, { method, limit: limit ?? 10 });
+        const found = searchEndpoints(intent, { method, limit: limit ?? 10 });
         // Schema preview rides only the top few hits — the agent acts on these, and
         // attaching it to every result would bloat a search the agent mostly scrolls past.
         // For a lower-ranked pick, describe_operation fetches the same detail on demand.
@@ -1202,7 +1264,7 @@ export function registerTools(
       } catch (e) {
         return fail(e);
       }
-    },
+    }),
   );
 
   server.registerTool(
