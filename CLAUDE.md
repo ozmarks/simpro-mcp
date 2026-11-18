@@ -73,7 +73,7 @@ only thing that flows through differently (the `requestBearer` wiring in
 
 The surface is **hybrid**: a small set of intent/workflow tools **plus a generic
 escape hatch** (`find_operation` → `simpro_api_get`/`simpro_api_post`/`simpro_api_put`/`simpro_api_delete`) that reaches
-all ~1,300 Simpro endpoints. A new endpoint does **not** need a dedicated tool — it's
+all ~1,500 Simpro endpoints. A new endpoint does **not** need a dedicated tool — it's
 already reachable via the escape hatch. A tool earns a dedicated slot only if it is:
 
 - **multi-call orchestration** (e.g. `get_breakdown`, `duplicate_work`, `customer_overview`),
@@ -100,7 +100,7 @@ Thin single-endpoint update/delete verbs intentionally live in the escape hatch.
 | `src/uploads.ts` | Chunked attachment upload: in-process `UploadStore` singleton (TTL sessions, memory cap), join + SHA-256 verify, background post with dedupe + retry. |
 | `src/catalog.ts` | Loads `simpro-api-index.json`, keyword-scores endpoints for `find_operation`. |
 | `src/format.ts` | Output shaping: HTML rich-text → compact text/markdown, recursive cleaning. |
-| `data/simpro-api-index.json` | Prebuilt index of ~1,300 endpoints (method/path/summary/tags/params). Ships with the build. |
+| `data/simpro-api-index.json` | Prebuilt index of ~1,500 endpoints (method/path/summary/tags/params). Ships with the build. |
 | `scripts/copy-data.mjs` | Copies `data/` → `dist/data/` so `dist/` is self-contained in prod. |
 | `tsconfig.test.json` | Test build: compiles `src/` + `test/` to `dist-test/` for `node --test`. |
 
@@ -158,7 +158,7 @@ These are non-obvious and were verified live; the code comments hold the full de
 - **Quote/job `Description` is rich text (HTML)**; plain-text line breaks collapse. Cost centre
   `Notes` are plain text.
 - **Filter schedules by job with `JobID`, not `Reference`.** `schedules/` takes `JobID=in(...)` (and the usual
-  operators) though it's missing from the API index, so many jobs' bookings come back in one paged query.
+  operators), so many jobs' bookings come back in one paged query.
   `Reference=in(<jobIDs>)` returns **0 rows with no error**, `Reference=in(<a-b>,…)` 422s ("cannot contain more
   than 1 '-'"), and `Project.ID` 422s ("does not allow search requests on its child objects").
 - **Cost-centre stage is only readable in bulk from the job log.** `jobCostCenters/` has no stage (a `Stage` filter
