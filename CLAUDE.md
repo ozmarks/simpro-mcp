@@ -47,8 +47,11 @@ only thing that flows through differently (the `requestBearer` wiring in
 - **HTTP passthrough** (`runHttp`): the per-request rebuild of server + client is
   for **auth isolation** (each request carries its own bearer), **not** scaling —
   the server is single-instance by design. Consequently the rate limiter is a
-  process-wide singleton (see below), not a client field. No bearer → rejected;
-  the api key is never a fallback here.
+  process-wide singleton (see below), not a client field. No bearer is **not**
+  rejected at the HTTP layer: `initialize`/`tools/list` answer 200, and only a tool
+  call fails (`ensureToken()` → "Unauthorized: …no Authorization: Bearer token").
+  The api key is never a fallback here. Broker mode, by contrast, 401s any `/mcp`
+  request without a valid broker token.
 - **broker** (`runBrokerHttp`, `src/auth/`): OAuth 2.0 broker in front of Simpro
   for the Claude connector. The key design choices:
   - **Stateless sealed-envelope tokens** (`seal.ts`, AES-256-GCM, `TOKEN_SEAL_KEY`):
