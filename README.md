@@ -4,418 +4,349 @@
 ![MCP](https://img.shields.io/badge/protocol-MCP-blue)
 ![Transports: stdio · broker · proxy](https://img.shields.io/badge/transports-stdio%20%C2%B7%20broker%20%C2%B7%20proxy-555)
 
-> **Unofficial.** This is an independent, third-party project. It is **not affiliated with,
-> endorsed by, or supported by Simpro**.
+An MCP server for Simpro. It gives an AI agent a set of tools for quotes, jobs, customers,
+catalogue items, scheduling and billing, plus generic GET/POST/PUT/DELETE tools that reach
+the rest of the Simpro API (about 1,500 endpoints).
 
-Lets an AI agent work with your Simpro account. Look up nearly anything from Simpro, pull together figures that would normally mean
-clicking through several screens. You ask in plain English; the agent does the lookups and
-changes in Simpro for you.
+This is an unofficial, third-party project. It is not affiliated with, endorsed by, or
+supported by Simpro.
 
-It reaches every part of the Simpro API, so even if there isn't a purpose-built tool for
-something, the agent can still get to it.
-
-> ⚠️ **This tool can write and delete, not just read.** It reaches the full Simpro API,
-> including the endpoints that update and delete records. An AI agent driving it can - by
-> mistake or by following a bad instruction - modify or destroy quotes, jobs, customers,
-> catalogue items, and more in your live Simpro account, in bulk, with no undo. It acts with
-> whatever permissions the key or login you give it has. **Don't hand it to an agent you
-> don't trust, don't let it run unattended against production, and give it a Simpro
-> login/key scoped to only what it actually needs.** If you want read-only safety, create a
-> Simpro user with read-only permissions and authenticate as that user.
+> [!WARNING]
+> The server can create, update and delete records, not just read them. An agent using it
+> can change or delete quotes, jobs, customers and catalogue items in your live Simpro
+> account, in bulk, with no undo. Don't give it to an agent you don't trust, and don't let
+> it run unattended against production.
 >
-> This was developed from an internal tool we use that sits behind our own MCP Gateway. We added some additional features to make it a bit more functional for the community, but the mcbp and OAuth Broker mode are not used by us internally.
->
-> This software is provided **"as is", without warranty of any kind**, express or implied.
-> You run it at your own risk; the authors accept no liability for any loss, damage, or
-> changes made to your Simpro data through its use.
+> The software is provided as is, without warranty of any kind. You use it at your own risk.
 
-## Prerequisites
-
-- **For the Claude Desktop install (option 1):** nothing but Claude Desktop and a Simpro
-  OAuth app - the `.mcpb` bundle carries its own runtime.
-- **To run from source or self-host (options 2 and 3):** **Node.js 24 or newer** and `npm`.
-- A **Simpro build** you can reach, and an **OAuth app** (or legacy API key) created in it -
-  each mode's section says exactly what it needs.
+We built this as an internal tool and run it behind our own MCP gateway (proxy mode). The
+`.mcpb` bundle and broker mode were added for other users and we don't run them ourselves.
 
 ## Contents
 
-- [Install into Claude Desktop (the easy way)](#1-install-into-claude-desktop-the-easy-way)
-  - [What you need from Simpro](#what-you-need-from-simpro)
-  - [Installing](#installing)
-  - [Logging in (the OAuth flow)](#logging-in-the-oauth-flow)
-  - [Other ways to authenticate](#other-ways-to-authenticate)
-  - [Run it locally from source](#run-it-locally-from-source)
-- [OAuth Broker Mode (for the AI agent connector)](#2-oauth-broker-mode-for-the-ai-agent-connector)
-- [HTTP Proxy Mode (for a shared/hosted setup)](#3-http-proxy-mode-for-a-sharedhosted-setup)
-- [Which mode do I want?](#which-mode-do-i-want)
-- [Connecting a client (config snippets)](#connecting-a-client-config-snippets)
-- [How the broker upgrades Simpro's sign-in](#how-the-broker-upgrades-simpros-sign-in)
-- [Building it yourself](#building-it-yourself)
+- [Choosing a setup](#choosing-a-setup)
+- [Claude Desktop extension](#claude-desktop-extension)
+- [Local MCP client with npx](#local-mcp-client-with-npx)
+- [Hosted: OAuth broker](#hosted-oauth-broker)
+- [Hosted: proxy behind a gateway](#hosted-proxy-behind-a-gateway)
+- [Configuration reference](#configuration-reference)
+- [How the broker handles sign-in](#how-the-broker-handles-sign-in)
+- [Development](#development)
+- [License](#license)
 
+## Choosing a setup
 
+| You want to | Use | Needs |
+|-------------|-----|-------|
+| Use Simpro from Claude Desktop on your own machine | [Claude Desktop extension](#claude-desktop-extension) | Claude Desktop |
+| Use it from Claude Code or another local MCP client | [npx](#local-mcp-client-with-npx) | Node.js 24+ |
+| Offer a connector your team signs in to individually | [OAuth broker](#hosted-oauth-broker) | Docker (or Node.js 24+), a public HTTPS address |
+| Run it behind an MCP gateway that already handles sign-in | [Proxy](#hosted-proxy-behind-a-gateway) | Your gateway, Docker or Node.js 24+ |
 
-## 1. Install into Claude Desktop (the easy way)
+Every setup needs a Simpro build you can reach and an OAuth app created in it, under
+**Setup → Integrations → API**. The local setups (Desktop extension and npx) can use a
+legacy API key instead of an OAuth app. You'll need:
 
-No command line, no setup files. You install the `.mcpb` bundle from Claude Desktop's
-extension settings, fill in a short form, and log in to Simpro once in your browser. After
-that the agent stays signed in and you just chat.
+| Value | Where it comes from |
+|-------|---------------------|
+| Build URL | The address you log in to, e.g. `https://yourbuild.simprosuite.com`. No path, no trailing slash. |
+| Company ID | `0` unless your build has more than one company. |
+| Client ID and secret | The OAuth app. Treat the secret like a password. |
+| Redirect URI | Set on the OAuth app. Each setup below says what it should be. |
+| API key | Only if you're using a legacy key instead of an OAuth app. Local setups only. |
 
-### What you need from Simpro
+## Claude Desktop extension
 
-You authenticate with a **Simpro OAuth app**, which signs you in through Simpro's own login
-screen - the recommended way. Create one in Simpro under **Setup → Integrations → API → New
-API Key** (choose an OAuth / "Authorization Code" application), then note:
+1. Create the Simpro OAuth app as an Authorization Code application, with the redirect URI
+   `http://localhost:8237/callback`. If port 8237 is taken on your machine, use another
+   port here and enter the same port in step 4.
+2. Download `simpro-mcp-server.mcpb` from the
+   [latest release](https://github.com/ozmarks/simpro-mcp/releases).
+3. In Claude Desktop, go to **Settings → Extensions → Advanced settings → Install
+   extension** and choose the file.
+4. Fill in the build URL, company ID, client ID and client secret. Leave the authentication
+   mode on `authorization_code`.
 
-| Thing | Where to find it |
-|-------|------------------|
-| **Build URL** | The web address you log in to, e.g. `https://yourbuild.simprosuite.com`. Just the address - nothing after `.com`. |
-| **Company ID** | Almost always `0` if your account has one company. |
-| **Client ID** | From the OAuth app you create. |
-| **Client secret** | From the same OAuth app. Treat it like a password. |
+The first time a tool runs, a browser tab opens at the Simpro login page. Log in, approve
+access, and close the tab. The extension caches a refresh token, so you won't be asked
+again unless the token is revoked or expires.
 
-**One important step:** in your Simpro OAuth app, set the **Redirect URI** to
-`http://localhost:8237/callback`. This is where Simpro sends you back after you log in. It
-must match exactly. If port `8237` is already in use on your machine, pick another and set
-the matching **Auth redirect port** on the install screen - but the registered redirect URI
-must use the same port.
+The install screen also offers two other authentication modes:
 
-### Installing
+- `client_credentials` signs in as the OAuth app itself, with no browser step. Use it
+  for unattended automation. Simpro's audit trail won't show which person made a change.
+- `api_key` uses a legacy Simpro API key. Paste the key into the **Simpro API Key** field
+  and leave the client ID and secret empty. Simpro has deprecated static keys, so use this
+  only if you can't create an OAuth app.
 
-1. Download the latest **`simpro-mcp-server.mcpb`** file from the
-   [Releases page](https://github.com/ozmarks/simpro-mcp/releases).
-2. In Claude Desktop, open **Settings → Extensions**, click **Advanced settings**, then
-   **Install extension** (you may first need to enable developer/extension installs there).
-   Pick the `simpro-mcp-server.mcpb` file you downloaded. An install screen appears.
-3. Fill in:
-   - **Build URL** and **Company ID**
-   - **Authentication mode** - leave on `authorization_code` (the browser login).
-   - **Client ID** and **Client secret** from your Simpro OAuth app.
-   - Leave **Auth redirect port** at `8237` unless you registered a different one.
-4. Click install.
+Claude Desktop stores the client secret, refresh token and any API key. Anyone who has them
+can act in your Simpro build. If one leaks, revoke the OAuth app or key in Simpro and create
+a new one.
 
-### Logging in (the OAuth flow)
+## Local MCP client with npx
 
-The first time the agent uses the tool, a browser tab opens at the Simpro login screen. Log
-in and approve access. The tab shows **"✓ Authorised"** - close it and return to your chat.
+The server is published to npm as
+[`@ozmarks-group/simpro-mcp-server`](https://www.npmjs.com/package/@ozmarks-group/simpro-mcp-server).
+Clients that launch MCP servers as a local command can run it with `npx`. Register
+`http://localhost:8237/callback` as the redirect URI on the Simpro OAuth app.
 
-That one login is all you need. The tool caches a refresh token, so it stays signed in
-across restarts and you won't be prompted again until that token is revoked or expires. If
-that ever happens, it just opens the login tab again.
-
-That's it - start a chat and ask something like *"show me open quotes for Acme"* or
-*"what's on job 4521?"*.
-
-> **Page size** is an optional setting on the install screen. Leave it at 50. It just caps
-> how many rows come back at once so big lists don't overwhelm a single answer - the agent
-> can always ask for more.
-
-### Other ways to authenticate
-
-The **Authentication mode** field on the install screen offers three choices:
-
-| Mode | What it is | When to use |
-|------|------------|-------------|
-| `authorization_code` | Browser login as **you**. Acts with your Simpro permissions. | **Default - recommended.** |
-| `client_credentials` | Machine login with no user. Acts with the OAuth app's full access. | Unattended/automation where there's no person to log in. Also needs Client ID + secret; no browser step. |
-| `api_key` | A legacy standalone API key. | Only if you can't create an OAuth app. Paste the key into the **Simpro API Key** field. Static keys are deprecated by Simpro. |
-
-### Keeping your credentials safe
-
-Your client secret, refresh token, and any API key are stored by Claude Desktop and used
-only to talk to your own Simpro build. Anyone with them can act in Simpro with the same
-access you've granted, so don't share the `.mcpb` install or those values with people who
-shouldn't have that access. If a credential is ever exposed, revoke the OAuth app or key in
-Simpro and create a new one.
-
-### Run it locally from source
-
-*For developers, or anyone running from a Git checkout instead of the `.mcpb` bundle.*
-*If you installed the extension above, you can skip this.*
-
-1. Copy `.env.example` → `.env` and set `SIMPRO_BASE_URL` and `SIMPRO_COMPANY_ID`,
-   plus **either** `SIMPRO_CLIENT_ID` + `SIMPRO_CLIENT_SECRET` (for the browser login
-   or machine login) **or** `SIMPRO_API_KEY` (the legacy key).
-2. The auth mode is worked out from what you set - `client_credentials` when both
-   client ID and secret are present, otherwise `api_key`. To force the browser login,
-   set `SIMPRO_AUTH_MODE=authorization_code`.
-3. `npm install && npm run build && npm start` - this runs over stdio, same as the
-   installed extension.
-
-For the browser login (`authorization_code`), you can sign in once up front with
-`npm run login` - it opens the Simpro login tab and caches the refresh token to
-`.simpro-tokens.json`. If you skip it, the server just runs the same login the first
-time a tool is used. See [Building it yourself](#building-it-yourself) for the full
-list of scripts.
-
----
-
-## 2. OAuth Broker Mode (for the AI agent connector)
-
-For connecting Simpro to an AI agent as a proper **connector**, where each person signs in
-to Simpro themselves through the normal Simpro login screen - no shared key, no per-person
-setup file. **For most people running this on a server, this is the mode you want.**
-
-**This is the mode the supplied Docker setup defaults to.** It's the safer default: the
-server authenticates users itself instead of trusting a credential handed to it from
-upstream. It still belongs behind a reverse proxy that terminates TLS and routes
-`PUBLIC_URL` to it - but the container is never the thing deciding to trust an inbound
-header.
-
-Simpro's own sign-in is an OAuth 2.0 design that modern agent connectors won't connect
-to directly. This server sits in the middle and **brings it up to the OAuth 2.1
-standard they require** - adding the security steps Simpro is missing while still handing off
-to the real Simpro login. From a user's point of view it's just "click connect, log in to
-Simpro." The exact steps it adds are written up in
-[How the broker upgrades Simpro's sign-in](#how-the-broker-upgrades-simpros-sign-in) further
-down.
-
-The server sits in front of Simpro and runs the sign-in handshake. A user adds the
-connector in their agent, gets sent to Simpro to log in, and from then on the agent acts as
-that person in Simpro. Their Simpro access is sealed inside the token the agent holds; the
-server keeps no database of logins.
-
-This mode needs a public web address and a Simpro OAuth app (created in Simpro under
-**Setup → Integrations**). In that OAuth app, set the **Redirect URL** to your public
-address followed by `/callback` - for example `https://simpro.yourcompany.com/callback`.
-
-### Settings
-
-Set these as environment variables, on top of `SIMPRO_BASE_URL` (and optionally
-`SIMPRO_COMPANY_ID`) from above.
-
-| Setting | Required | What it does |
-|---------|----------|--------------|
-| `SIMPRO_TRANSPORT` | yes | Set to `broker` to turn on this mode. |
-| `PUBLIC_URL` | yes | The public web address people reach the connector at, e.g. `https://simpro.yourcompany.com`. |
-| `SIMPRO_CLIENT_ID` | yes | From your Simpro OAuth app. |
-| `SIMPRO_CLIENT_SECRET` | yes | From your Simpro OAuth app. Keep it secret. |
-| `TOKEN_SEAL_KEY` | recommended | The secret used to seal each person's Simpro access inside their agent token. Generate one with `openssl rand -hex 32`. If you leave it unset the server makes one on first run and saves it to a `.token-seal-key` file - but **that file must survive restarts**, or everyone is signed out. Set it explicitly in production. |
-| `SIMPRO_AUTH_URL` | no | Only set if your Simpro login URL is non-standard. Otherwise worked out automatically from `SIMPRO_BASE_URL`. |
-| `SIMPRO_TOKEN_URL` | no | Same - only set if non-standard. |
-| `PORT` | no | Port the server listens on. Defaults to `3000`. |
-| `HOST` | no | Network interface to bind. Defaults to `0.0.0.0` (all interfaces). Set to `127.0.0.1` to accept only same-host connections. |
-| `MCP_PATH` | no | Web path the server is reached at. Defaults to `/mcp`. (Health check is always at `/healthz`.) |
-
-Do **not** set `SIMPRO_API_KEY` in this mode - the server will refuse to start.
-
-| Setting | Default | What it does |
-|---------|---------|--------------|
-| `SIMPRO_DEFAULT_PAGE_SIZE` | `50` | Rows per page for list results when not specified. Max 250. |
-| `SIMPRO_MAX_RESULT_BYTES` | `100000` | Largest single answer allowed before it's held back and the agent is asked to narrow the request. |
-| `SIMPRO_MAX_UPLOAD_BYTES` | `52428800` | Largest file accepted by the chunked attachment upload tools (50 MB). |
-| `SIMPRO_UPLOAD_MEMORY_BYTES` | `209715200` | Total bytes all in-progress uploads may hold in memory at once (200 MB). |
-
----
-
-## 3. HTTP Proxy Mode (for a shared/hosted setup)
-
-For teams running this on a server behind something that already handles sign-in (for
-example a Cowork or Copilot setup). In this mode the server holds **no** Simpro key of its
-own - each request brings its own login, attached by whatever signs your users in. The
-server just passes it through to Simpro. 
-
-> ⚠️ **Not designed to be internet-facing.** This mode must run **behind a gateway or
-> reverse proxy** (an MCP gateway, Context Forge, or something like nginx/Traefik) that
-> terminates TLS and authenticates users. It does no auth of its own and is not hardened for
-> direct exposure - never publish it straight to the internet. The container intentionally
-> isn't published on the host by default; the gateway reaches it on a private network.
-
-To use this mode, set `SIMPRO_TRANSPORT=proxy` (the supplied Docker setup defaults to the
-safer **broker mode** above). If you're deploying with Portainer or Context Forge, see
-[`docs/deploy.md`](docs/deploy.md) for the stack layout.
-
-You won't set an API key here - in fact the server refuses to start if one is present,
-because in this mode the per-user login is the only thing that should be granting access.
-
-**Important - this mode does no checking of its own.** Whatever `Authorization` header
-arrives with a request is forwarded straight through to Simpro, untouched. The server does
-**not** verify that the credential is valid, unexpired, or that the request came from
-someone allowed to make it - Simpro is the only thing that decides whether the credential
-works. That's by design: this mode assumes the layer in front of it (the gateway or sign-in
-system) has already authenticated the user and attached a trustworthy header. **Only run
-this mode behind such a layer.** If you expose it directly, anyone who can reach it can have
-their header passed to Simpro as-is.
-
-### Settings
-
-These are set as environment variables (in your `.env` file or by your container platform).
-
-| Setting | Required | What it does |
-|---------|----------|--------------|
-| `SIMPRO_TRANSPORT` | yes | Set to `proxy` to turn on this mode. |
-| `SIMPRO_BASE_URL` | yes | Your Simpro build address, e.g. `https://yourbuild.simprosuite.com`. Nothing after `.com`. |
-| `SIMPRO_COMPANY_ID` | no | Your company ID. Defaults to `0`. |
-| `PORT` | no | Port the server listens on. Defaults to `3000`. |
-| `HOST` | no | Network interface to bind. Defaults to `0.0.0.0` (all interfaces). Set to `127.0.0.1` to accept only same-host connections. |
-| `MCP_PATH` | no | Web path the server is reached at. Defaults to `/mcp`. (Health check is always at `/healthz`.) |
-
-Do **not** set `SIMPRO_API_KEY` in this mode - the server will refuse to start.
-
-You can also tune how much data comes back at once:
-
-| Setting | Default | What it does |
-|---------|---------|--------------|
-| `SIMPRO_DEFAULT_PAGE_SIZE` | `50` | Rows per page for list results when not specified. Max 250. |
-| `SIMPRO_MAX_RESULT_BYTES` | `100000` | Largest single answer allowed before it's held back and the agent is asked to narrow the request. |
-| `SIMPRO_MAX_UPLOAD_BYTES` | `52428800` | Largest file accepted by the chunked attachment upload tools (50 MB). |
-| `SIMPRO_UPLOAD_MEMORY_BYTES` | `209715200` | Total bytes all in-progress uploads may hold in memory at once (200 MB). |
-
----
-
-## 4. Which mode do I want?
-
-| You want to… | Use |
-|--------------|-----|
-| Use Simpro from Claude Desktop on your own machine | **Install into Claude Desktop** (option 1) |
-| Offer Simpro as a connector your team can sign in to individually | **OAuth Broker Mode** (option 2) |
-| Run a shared server where sign-in is handled elsewhere and you have your own gateway | **HTTP Proxy Mode** (option 3) |
-
----
-
-## 5. Connecting a client (config snippets)
-
-The Claude Desktop `.mcpb` install (option 1) writes its own config - you won't touch JSON
-for that. These snippets are for **running from a source checkout** or **pointing a client at
-a hosted broker/proxy** instead.
-
-### Claude Desktop - stdio from source
-
-Edit `claude_desktop_config.json` (Settings → Developer → Edit Config). Point `command` at
-`node` and `args` at the built `dist/index.js`, and pass your Simpro settings as `env`:
-
-```json
-{
-  "mcpServers": {
-    "simpro": {
-      "command": "node",
-      "args": ["/absolute/path/to/simpro-mcp/dist/index.js"],
-      "env": {
-        "SIMPRO_BASE_URL": "https://yourbuild.simprosuite.com",
-        "SIMPRO_COMPANY_ID": "0",
-        "SIMPRO_AUTH_MODE": "authorization_code",
-        "SIMPRO_CLIENT_ID": "your-oauth-client-id",
-        "SIMPRO_CLIENT_SECRET": "your-oauth-client-secret"
-      }
-    }
-  }
-}
-```
-
-Build first (`npm install && npm run build`). On Windows use a full path with escaped
-backslashes (`"C:\\path\\to\\simpro-mcp\\dist\\index.js"`). For the legacy key, drop the
-client id/secret and set `"SIMPRO_API_KEY"` instead (stdio only).
-
-### Claude Code - `claude mcp add`
-
-Register the same stdio server from the CLI (run from the checkout, or use an absolute path):
+Claude Code:
 
 ```bash
 claude mcp add simpro \
   --env SIMPRO_BASE_URL=https://yourbuild.simprosuite.com \
   --env SIMPRO_COMPANY_ID=0 \
   --env SIMPRO_AUTH_MODE=authorization_code \
-  --env SIMPRO_CLIENT_ID=your-oauth-client-id \
-  --env SIMPRO_CLIENT_SECRET=your-oauth-client-secret \
-  -- node ./dist/index.js
+  --env SIMPRO_CLIENT_ID=your-client-id \
+  --env SIMPRO_CLIENT_SECRET=your-client-secret \
+  -- npx -y @ozmarks-group/simpro-mcp-server
 ```
 
-### Pointing a client at a hosted broker (option 2)
+Claude Desktop (`claude_desktop_config.json`, under **Settings → Developer → Edit
+Config**), or any client using the same format:
 
-Once the broker is running behind your public address, add it as a **remote connector** -
-there's no local command and no env. Use the connector/"Add custom connector" UI in your
-client and give it the MCP URL:
-
+```json
+{
+  "mcpServers": {
+    "simpro": {
+      "command": "npx",
+      "args": ["-y", "@ozmarks-group/simpro-mcp-server"],
+      "env": {
+        "SIMPRO_BASE_URL": "https://yourbuild.simprosuite.com",
+        "SIMPRO_COMPANY_ID": "0",
+        "SIMPRO_AUTH_MODE": "authorization_code",
+        "SIMPRO_CLIENT_ID": "your-client-id",
+        "SIMPRO_CLIENT_SECRET": "your-client-secret"
+      }
+    }
+  }
+}
 ```
-https://simpro.yourcompany.com/mcp
+
+To use an API key instead, replace the auth mode, client ID and client secret with
+`SIMPRO_API_KEY`:
+
+```json
+"env": {
+  "SIMPRO_BASE_URL": "https://yourbuild.simprosuite.com",
+  "SIMPRO_COMPANY_ID": "0",
+  "SIMPRO_API_KEY": "your-api-key"
+}
 ```
 
-The client is sent to Simpro to log in; nothing else to configure. (The HTTP proxy of
-option 3 is reached the same way, but expects your gateway to attach the bearer - it isn't
-added as a bare connector.)
+If you leave out `SIMPRO_AUTH_MODE`, it is worked out from what you set: `client_credentials`
+when both client ID and secret are present, otherwise `api_key`.
 
----
+## Hosted: OAuth broker
 
-## 6. How the broker upgrades Simpro's sign-in
+In broker mode the server is an OAuth 2.1 authorisation server in front of Simpro. You add
+it to Claude (or another MCP client) as a remote connector. Each person clicks connect, logs
+in on the normal Simpro login page, and the agent then acts as them. The server stores no
+logins. Each person's Simpro tokens are encrypted, using `TOKEN_SEAL_KEY`, inside the token
+their MCP client holds.
 
-*This section is for the technically curious or anyone reviewing the security of the
-connector. You don't need it to use any of the three modes above.*
+It needs:
 
-Modern agent connectors only connect to authorization servers that meet the **OAuth 2.1**
-bar. Simpro's OAuth doesn't do PKCE and doesn't support the client identity schemes those connectors use. Rather than
-ask Simpro to change, the broker stands in front of it as a compliant OAuth 2.1
-authorisation server in its own right, and quietly relays to Simpro behind the scenes.
-Concretely, it adds:
+- A public HTTPS address, e.g. `https://simpro.example.com`, on a reverse proxy that
+  terminates TLS and forwards to the container. The container speaks plain HTTP.
+- A Simpro OAuth app with the redirect URI set to that address plus `/callback`, e.g.
+  `https://simpro.example.com/callback`.
+- A single instance without any load-balancing. Sign-in state is held in memory.
 
-- **PKCE (S256), enforced by us.** The connecting client must send a code challenge on
-  `/authorize` and prove it on `/token`; a mismatch is rejected. Simpro itself does no PKCE,
-  so the broker is the party actually enforcing it - closing the stolen-authorization-code
-  gap that plain 2.0 leaves open.
-- **Modern client identity - no shared secret baked into the client.** The connecting client
-  tells the broker who it is in one of two standard ways, and the broker accepts whichever a
-  given client uses:
-  - **CIMD** (client-ID-metadata-document): the client_id is a URL the broker fetches
-    and validates per request - it must be self-referential and list the exact redirect
-    address being used. Nothing is pre-registered. The fetch runs behind an anti-SSRF guard
-    so that URL can't be used to probe the server's internal network.
-  - **DCR** (dynamic client registration, RFC 7591): a client can `POST /register` to mint
-    its own client_id up front. The broker advertises this endpoint in its metadata.
-    Registration is open (no auth), so it's rate-/size-capped and evicts the oldest entries
-    at the cap; registered clients are persisted so they survive a restart. A client may
-    register as public (no secret) or confidential (the broker issues a secret and then
-    requires it at the token step).
+### With Docker
 
-  Either way, the downstream client's identity never reaches Simpro: the broker holds one
-  fixed Simpro registration and relays under that.
-- **Exact redirect matching.** The address the client is sent back to must match the one
-  registered, character for character - not just "starts with."
-- **Short-lived, audience-bound tokens.** The token the client receives is one the *broker*
-  issues, stamped with an expiry and tied to this specific server as its audience. The real
-  Simpro tokens are encrypted (sealed) inside it. The broker keeps no token database - every
-  token is self-contained - and the refresh token it issues has a capped 30-day lifetime so
-  a leaked one can't be replayed indefinitely. The one exception: because Simpro rotates
-  refresh tokens on use (each refresh burns the old one), the broker holds the *current*
-  upstream refresh token per login **in memory only**, for a few minutes, so a client that
-  drops a refresh response isn't forced to log in again. It's never written to disk; the
-  next successful refresh - confirming the client now holds the current token - retires it,
-  and a restart or a few minutes' idle clears it.
+The image is published to GHCR as `ghcr.io/ozmarks/simpro-mcp`. The repository's
+[`docker-compose.yml`](docker-compose.yml) runs it in broker mode. Put it in a directory
+with a `.env` file next to it:
 
-The net effect: the agent talks to something that looks like a clean, modern OAuth 2.1
-provider, the user still logs in at the genuine Simpro screen, and the weaker parts of
-Simpro's flow are shored up in the middle. The whole exchange is correlated in memory only
-for the few seconds the handshake takes, which is why this mode must run as a **single
-instance** - don't put it behind a load balancer.
+```ini
+SIMPRO_BASE_URL=https://yourbuild.simprosuite.com
+SIMPRO_COMPANY_ID=0
+PUBLIC_URL=https://simpro.example.com
+SIMPRO_CLIENT_ID=your-client-id
+SIMPRO_CLIENT_SECRET=your-client-secret
+TOKEN_SEAL_KEY=output-of-openssl-rand-hex-32
+```
 
----
+```bash
+docker compose up -d
+curl http://127.0.0.1:3000/healthz   # ok
+```
 
-## Building it yourself
+To change any other setting from the
+[configuration reference](#configuration-reference), add it under `environment:` in the
+compose file.
 
-If you're working on the code rather than just using it:
+The compose file publishes port 3000 on `127.0.0.1` only, for a reverse proxy on the same
+host. If your proxy runs in another container, put both on a shared Docker network and
+remove the `ports:` entry.
+
+On platforms like Portainer, deploy the compose file as a stack and set the same variables
+in the stack's environment settings.
+
+### With npx
+
+```bash
+SIMPRO_TRANSPORT=broker \
+SIMPRO_BASE_URL=https://yourbuild.simprosuite.com \
+PUBLIC_URL=https://simpro.example.com \
+SIMPRO_CLIENT_ID=your-client-id \
+SIMPRO_CLIENT_SECRET=your-client-secret \
+TOKEN_SEAL_KEY=output-of-openssl-rand-hex-32 \
+npx -y @ozmarks-group/simpro-mcp-server
+```
+
+Always set `TOKEN_SEAL_KEY` when running this way. Without it the server generates a key
+and saves it inside npx's package cache, and everyone is signed out whenever that cache is
+cleared or the version changes.
+
+### Connecting a client
+
+Add a custom connector in your client with the URL `https://simpro.example.com/mcp`. The
+client is sent to Simpro to log in. There's nothing else to configure.
+
+Any request to `/mcp` without a valid broker token, including listing the tools, gets
+`401 Unauthorized`. The `WWW-Authenticate` header points the client at the OAuth metadata,
+which is how it knows to start the sign-in.
+
+See [`docs/deploy.md`](docs/deploy.md) for the state the broker keeps, health checks and
+logging.
+
+## Hosted: proxy behind a gateway
+
+In proxy mode the server does no authentication. Each request must carry a Simpro access
+token in its `Authorization: Bearer` header, and the server forwards it to Simpro unchanged.
+It doesn't check the token. Simpro decides whether it's valid.
+
+Requests without a token are not rejected. `initialize` and `tools/list` succeed, so
+anyone who can reach the server can see the tool names and their arguments. A tool call
+returns a tool error, "Unauthorized: this request carried no Authorization: Bearer token.",
+without contacting Simpro.
+
+Use this only behind an MCP gateway or reverse proxy that signs users in to Simpro and
+attaches their token. Never expose it to the internet directly: anyone who can reach it can
+send requests to Simpro with whatever token they have.
+
+Gateways that launch MCP servers as a command can run it with npx:
+
+```bash
+SIMPRO_TRANSPORT=proxy \
+SIMPRO_BASE_URL=https://yourbuild.simprosuite.com \
+npx -y @ozmarks-group/simpro-mcp-server
+```
+
+To run it as a container, see the
+[proxy mode example](docs/deploy.md#proxy-mode-container) in `docs/deploy.md`.
+
+If your gateway runs its own OAuth flow against Simpro, the authorisation endpoint is
+`<build URL>/oauth2/login` (not `/authorize`), the token endpoint is
+`<build URL>/oauth2/token`, and the only scope Simpro accepts is `openid`.
+
+## Configuration reference
+
+All settings are environment variables. When running from a source checkout, they can also
+go in a `.env` file at the repository root (see [`.env.example`](.env.example)), or in any
+file named by `SIMPRO_ENV_FILE`. Variables already set in the environment take precedence.
+
+### All modes
+
+| Variable | Default | |
+|----------|---------|---|
+| `SIMPRO_BASE_URL` | (required) | Simpro build address. No path, no trailing slash. |
+| `SIMPRO_COMPANY_ID` | `0` | |
+| `SIMPRO_TRANSPORT` | `stdio` | `stdio`, `broker` or `proxy`. The Docker image defaults to `broker`. |
+| `SIMPRO_DEFAULT_PAGE_SIZE` | `50` | Rows per page when a tool call doesn't specify one. Max 250. |
+| `SIMPRO_MAX_RESULT_BYTES` | `100000` | Results larger than this are withheld and the agent is told to narrow the request. |
+| `SIMPRO_MAX_UPLOAD_BYTES` | `52428800` | Largest attachment the upload tools accept (50 MB). |
+| `SIMPRO_UPLOAD_MEMORY_BYTES` | `209715200` | Memory all in-progress uploads may use together (200 MB). |
+| `SIMPRO_VERSION_CHECK` | on | Set to `off` to stop the server checking GitHub for newer releases. |
+
+### stdio
+
+| Variable | Default | |
+|----------|---------|---|
+| `SIMPRO_AUTH_MODE` | inferred | `authorization_code`, `client_credentials` or `api_key`. |
+| `SIMPRO_CLIENT_ID`, `SIMPRO_CLIENT_SECRET` | | Needed for `authorization_code` and `client_credentials`. |
+| `SIMPRO_AUTH_REDIRECT_PORT` | `8237` | Port for the login callback. The redirect URI on the OAuth app must be `http://localhost:<port>/callback`. |
+| `SIMPRO_API_KEY` | | Legacy key, for `api_key` mode. stdio only. |
+
+### broker and proxy
+
+| Variable | Default | |
+|----------|---------|---|
+| `PORT` | `3000` | |
+| `HOST` | `0.0.0.0` | Set to `127.0.0.1` to accept same-host connections only. |
+| `MCP_PATH` | `/mcp` | The health check is always at `/healthz`. |
+| `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS` | | Comma-separated allow-lists for the `Host` and `Origin` headers on the MCP path. Requests that don't match get 403. Off unless one is set. Broker mode adds `PUBLIC_URL`'s host automatically. |
+
+The server won't start in either HTTP mode if `SIMPRO_API_KEY` is set.
+
+### broker only
+
+| Variable | Default | |
+|----------|---------|---|
+| `PUBLIC_URL` | (required) | The public HTTPS address of the server. |
+| `SIMPRO_CLIENT_ID`, `SIMPRO_CLIENT_SECRET` | (required) | The Simpro OAuth app. |
+| `TOKEN_SEAL_KEY` | generated | 32 bytes as hex or base64 (`openssl rand -hex 32`). Encrypts the tokens the broker issues. If it changes, everyone is signed out. If unset, a key is generated and saved in the state directory. |
+| `SIMPRO_AUTH_URL` | `<base>/oauth2/login` | Only change it if your build uses a different login URL. |
+| `SIMPRO_TOKEN_URL` | `<base>/oauth2/token` | |
+| `STATIC_CLIENTS` | | JSON array of pre-registered confidential clients, for connectors that don't use CIMD or dynamic registration. Example in `.env.example`. |
+| `SIMPRO_REFRESH_GRACE_TTL_MS` | `600000` | How long the broker holds a rotated Simpro refresh token in memory, so a client that lost a refresh response can retry. |
+
+## How the broker handles sign-in
+
+MCP clients such as Claude only connect to authorisation servers that follow OAuth 2.1.
+Simpro's OAuth is 2.0 without PKCE and without the client registration methods those
+clients use. The broker acts as the OAuth 2.1 server and passes the actual login through to
+Simpro. It adds:
+
+- **PKCE (S256).** The client sends a code challenge to `/authorize` and must prove it at
+  `/token`. Simpro doesn't check PKCE, so the broker does.
+- **Client registration without a shared secret.** A client can identify itself in two
+  ways:
+  - CIMD: the client ID is a URL to a metadata document. The broker fetches it on each
+    authorisation, checks that it names itself and lists the exact redirect URI in use, and
+    guards the fetch against requests to private network addresses.
+  - Dynamic client registration (RFC 7591): the client calls `POST /register` to get a
+    client ID. Registration is open, so it is rate- and size-limited, the oldest entries
+    are dropped at the cap, and registrations are saved to disk.
+
+  Simpro never sees the client's identity. Every login goes to Simpro under the one OAuth
+  app the broker is configured with.
+- **Exact redirect URI matching.** Prefix matches are rejected.
+- **Short-lived tokens bound to this server.** Clients get tokens issued by the broker, with
+  an expiry and this server as the audience. The Simpro tokens are encrypted inside them.
+  Refresh tokens last at most 30 days.
+
+The broker keeps no token database, with one exception. Simpro invalidates a refresh token
+when it's used, so if a client loses the response to a refresh it would otherwise have to
+log in again. To cover that, the broker keeps the newest Simpro refresh token for each login
+in memory for a few minutes. It is never written to disk and is cleared on the next
+successful refresh or on restart.
+
+## Development
 
 ```bash
 npm install
-npm run build        # compile
-npm test             # run the unit tests
-npm run login        # one-time browser sign-in (authorization_code); caches the refresh token
-npm run build:mcpb   # produce the simpro-mcp-server.mcpb install file
-npm start            # run it locally
+npm run build        # compile to dist/
+npm test             # unit tests
+npm start            # run dist/index.js
+npm run login        # authorization_code login only: cache the refresh token, then exit
+npm run build:mcpb   # build simpro-mcp-server.mcpb
 ```
 
-`npm run login` runs the compiled `dist/login.js`, so build first; it needs
-`SIMPRO_CLIENT_ID` and `SIMPRO_CLIENT_SECRET` set (see *Run it locally from source*
-above).
+Copy `.env.example` to `.env` and fill it in before running: the build URL and company ID,
+plus either the OAuth client ID and secret or `SIMPRO_API_KEY`. `npm start` uses stdio unless
+`SIMPRO_TRANSPORT` says otherwise.
 
-There's a unit-test suite (`npm test`) covering the pure, deterministic pieces - search
-ranking, output formatting, line-item paths, and the auth crypto/store helpers. There's no
-linter, and nothing mocks the network, so fully checking a change still means building it
-and trying it against a real Simpro account. Architecture notes and the Simpro API quirks
-worth knowing are in `CLAUDE.md`.
-
----
+The unit tests cover the code that doesn't talk to the network: search ranking, output
+formatting, line-item paths, and the auth crypto and storage helpers. Nothing mocks Simpro,
+so checking a change properly means running it against a real Simpro build. Architecture
+notes and Simpro API quirks are in [`CLAUDE.md`](CLAUDE.md).
 
 ## License
 
-Licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md)
-(`FSL-1.1-ALv2`). You can use, modify and redistribute it for any purpose other than a
-Competing Use (offering it, or something substantially similar, to others as a commercial
-product or service). Each release converts to the Apache License 2.0 two years after it is
-published.
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md) (`FSL-1.1-ALv2`).
+You can use, modify and redistribute it for any purpose except a Competing Use: offering
+it, or something substantially similar, to others as a commercial product or service. Each
+release becomes available under the Apache License 2.0 two years after it is published.
